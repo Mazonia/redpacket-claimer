@@ -28,7 +28,6 @@ PHONE = os.getenv("TELEGRAM_PHONE", "").strip()
 TARGET_CHANNEL_RAW = os.getenv("TARGET_CHANNEL", "").strip()
 HEADLESS_MODE = os.getenv("HEADLESS", "false").lower() == "true"
 
-# Support comma-separated list of target channels (e.g. "@Freerewardes, Cryptobox Parser")
 TARGET_CHANNELS = [c.strip() for c in TARGET_CHANNEL_RAW.split(",") if c.strip()]
 
 if not API_ID or not API_HASH or not TARGET_CHANNELS:
@@ -100,44 +99,79 @@ async def process_single_item(item_type: str, identifier: str, extra: str = ""):
         claimed_items.add(identifier)
         save_claimed_cache(claimed_items)
 
-async def scan_and_claim_history(channel_entities: List[Any], code_limit: int = 100, question_limit: int = 5):
-    channel_names = ", ".join([str(c) for c in TARGET_CHANNELS])
+def determine_sweep_limits(channel_name: str) -> tuple[int, int]:
+    """
+    Returns (code_limit, question_limit) based on channel name.
+    Cryptobox Parser: 15 codes
+    Freerewardes: 10 codes, 5 questions
+    """
+    ch_lower = channel_name.lower()
+    if "cryptobox" in ch_lower or "parser" in ch_lower:
+        return 15, 0
+    elif "freereward" in ch_lower:
+        return 10, 5
+    else:
+        return 10, 5
+
+async def scan_and_claim_history(channel_entities: List[Any]):
     console.print(Panel(
-        f"[bold cyan]🔍 Scanning history across {len(channel_entities)} channel(s) ({channel_names}) for up to {code_limit} Red Packet codes...[/bold cyan]",
-        title="[bold yellow]Multi-Channel 100-Code Historical Sweep Mode[/bold yellow]"
+        "[bold cyan]🔍 Starting Per-Channel Historical Sweep...[/bold cyan]\n"
+        "[bold white]• Cryptobox Parser:[/bold white] Recent 15 codes\n"
+        "[bold white]• Freerewardes:[/bold white] Recent 10 codes & 5 questions",
+        title="[bold yellow]Targeted Catch-Up Mode[/bold yellow]"
     ))
 
-    recent_codes: List[str] = []
-    recent_questions: List[Dict[str, str]] = []
+    all_recent_codes: List[str] = []
+    all_recent_questions: List[Dict[str, str]] = []
 
     for entity in channel_entities:
-        if len(recent_codes) >= code_limit and len(recent_questions) >= question_limit:
-            break
+        chat_name = str(entity)
         try:
-            async for msg in client.iter_messages(entity, limit=400):
+            chat = await client.get_entity(entity)
+            chat_name = getattr(chat, 'title', getattr(chat, 'username', str(entity)))
+        except Exception:
+            pass
+
+        code_limit, question_limit = determine_sweep_limits(chat_name)
+        console.print(f"[cyan][+] Scanning recent history from '[bold white]{chat_name}[/bold white]' (Target: {code_limit} codes, {question_limit} questions)...[/cyan]")
+
+        ch_codes: List[str] = []
+        ch_questions: List[Dict[str, str]] = []
+
+        try:
+            async for msg in client.iter_messages(entity, limit=200):
                 if not msg.raw_text:
                     continue
                 parsed = parse_telegram_message(msg.raw_text)
 
                 for c in parsed.get("codes", []):
-                    if c not in recent_codes and len(recent_codes) < code_limit:
-                        recent_codes.append(c)
+                    if c not in ch_codes and len(ch_codes) < code_limit:
+                        ch_codes.append(c)
 
                 sq_urls = parsed.get("square_urls", [])
                 answers = parsed.get("answers", [])
-                if sq_urls and answers:
+                if sq_urls and answers and question_limit > 0:
                     url = sq_urls[0]
                     ans = answers[0]
-                    if not any(q["url"] == url for q in recent_questions) and len(recent_questions) < question_limit:
-                        recent_questions.append({"url": url, "answer": ans})
+                    if not any(q["url"] == url for q in ch_questions) and len(ch_questions) < question_limit:
+                        ch_questions.append({"url": url, "answer": ans})
 
-                if len(recent_codes) >= code_limit and len(recent_questions) >= question_limit:
+                if len(ch_codes) >= code_limit and (question_limit == 0 or len(ch_questions) >= question_limit):
                     break
         except Exception as e:
-            console.print(f"[yellow][!] Notice while scanning history from {entity}: {e}[/yellow]")
+            console.print(f"[yellow][!] Notice while scanning history from {chat_name}: {e}[/yellow]")
 
-    uncached_codes = [c for c in recent_codes if c not in claimed_items]
-    history_table = Table(title=f"📋 Multi-Channel History Summary ({len(recent_codes)} Codes Found, {len(uncached_codes)} New To Claim)", show_header=True, header_style="bold magenta")
+        for c in ch_codes:
+            if c not in all_recent_codes:
+                all_recent_codes.append(c)
+
+        for q in ch_questions:
+            if not any(item["url"] == q["url"] for item in all_recent_questions):
+                all_recent_questions.append(q)
+
+    # Summary Table
+    uncached_codes = [c for c in all_recent_codes if c not in claimed_items]
+    history_table = Table(title=f"📋 Sweep Summary ({len(all_recent_codes)} Total Codes Found, {len(uncached_codes)} New To Claim)", show_header=True, header_style="bold magenta")
     history_table.add_column("#", style="dim", width=4)
     history_table.add_column("Type", style="cyan", width=12)
     history_table.add_column("Item / Code / URL", style="bold white")
@@ -145,29 +179,31 @@ async def scan_and_claim_history(channel_entities: List[Any], code_limit: int = 
     history_table.add_column("Status", style="bold")
 
     idx = 1
-    for c in recent_codes:
+    for c in all_recent_codes:
         status = "[dim]Cached (Skipped)[/dim]" if c in claimed_items else "[bold green]Ready To Claim[/bold green]"
         history_table.add_row(str(idx), "Crypto Box", c, "-", status)
         idx += 1
 
-    for q in recent_questions:
+    for q in all_recent_questions:
         status = "[dim]Cached (Skipped)[/dim]" if q["url"] in claimed_items else "[bold green]Ready To Claim[/bold green]"
         history_table.add_row(str(idx), "Square Post", q["url"], q["answer"], status)
         idx += 1
 
     console.print(history_table)
 
-    if recent_codes:
-        console.print(f"\n[bold cyan]▶ Sweeping {len(recent_codes)} historical codes...[/bold cyan]")
-        for c in recent_codes:
+    # Claim discovered codes
+    if all_recent_codes:
+        console.print(f"\n[bold cyan]▶ Attempting to claim {len(all_recent_codes)} historical codes...[/bold cyan]")
+        for c in all_recent_codes:
             await process_single_item("code", c)
 
-    if recent_questions:
-        console.print(f"\n[bold cyan]▶ Sweeping {len(recent_questions)} historical questions...[/bold cyan]")
-        for q in recent_questions:
+    # Claim discovered questions
+    if all_recent_questions:
+        console.print(f"\n[bold cyan]▶ Attempting to claim {len(all_recent_questions)} historical questions...[/bold cyan]")
+        for q in all_recent_questions:
             await process_single_item("square", q["url"], q["answer"])
 
-    console.print("\n[bold green][✓] Multi-channel 100-code sweep completed![/bold green]\n")
+    console.print("\n[bold green][✓] Targeted historical sweep completed![/bold green]\n")
 
 @client.on(events.NewMessage(chats=TARGET_CHANNELS))
 async def live_message_handler(event):
@@ -201,7 +237,7 @@ async def live_message_handler(event):
         await process_single_item("url", rp_url)
 
 async def main():
-    table = Table(title="🚀 Binance Red Packet & Feed Auto-Claimer (Multi-Channel Support)", show_header=True, header_style="bold magenta")
+    table = Table(title="🚀 Binance Red Packet & Feed Auto-Claimer", show_header=True, header_style="bold magenta")
     table.add_column("Setting", style="dim", width=25)
     table.add_column("Value", style="bold green")
     table.add_row("Target Channels", ", ".join(TARGET_CHANNELS))
@@ -224,12 +260,12 @@ async def main():
             entity = await client.get_entity(ch)
             resolved_entities.append(entity)
         except Exception as e:
-            console.print(f"[yellow][!] Notice: Could not resolve channel '{ch}' directly, using as raw handle: {e}[/yellow]")
+            console.print(f"[yellow][!] Notice: Could not resolve channel '{ch}' directly, using raw handle: {e}[/yellow]")
             resolved_entities.append(ch)
 
-    await scan_and_claim_history(resolved_entities, code_limit=100, question_limit=5)
+    await scan_and_claim_history(resolved_entities)
 
-    console.print(f"[bold gold1]📡 Multi-channel bot is actively listening on: {', '.join(TARGET_CHANNELS)}... (Press Ctrl+C to stop)[/bold gold1]\n")
+    console.print(f"[bold gold1]📡 Bot is actively listening for live drops on: {', '.join(TARGET_CHANNELS)}... (Press Ctrl+C to stop)[/bold gold1]\n")
     await client.run_until_disconnected()
 
 if __name__ == "__main__":

@@ -1,4 +1,4 @@
-import os
+﻿import os
 import asyncio
 import random
 from typing import Optional, List, Dict, Any
@@ -18,33 +18,66 @@ class BinanceRedeemer:
         self.page: Optional[Page] = None
         self._pw = None
 
-    async def _human_delay(self, min_s: float = 0.5, max_s: float = 1.2):
+    async def _human_delay(self, min_s: float = 0.6, max_s: float = 1.8):
         """Randomized delay to emulate natural human interaction."""
         await asyncio.sleep(random.uniform(min_s, max_s))
 
-    async def _dismiss_modals(self):
-        """Dismisses any active dialogs, overlays, or popups from previous claims."""
+    async def _human_type(self, element, text: str):
+        """Types text character by character with humanized random pauses."""
+        await element.fill("")
+        for char in text:
+            await element.type(char, delay=random.uniform(70, 180))
+            await asyncio.sleep(random.uniform(0.02, 0.08))
+
+    async def _random_mouse_jitter(self):
+        """Emulates subtle human mouse movements."""
         if not self.page:
             return
         try:
-            # Press Escape to dismiss generic modals
-            await self.page.keyboard.press("Escape")
-            await asyncio.sleep(0.3)
+            x = random.randint(200, 800)
+            y = random.randint(200, 600)
+            await self.page.mouse.move(x, y, steps=random.randint(3, 8))
+        except Exception:
+            pass
 
-            # Check for close buttons
-            close_selectors = [
+    async def _dismiss_modals(self):
+        """Aggressively dismisses any active dialogs, overlays, popups, or expired banners."""
+        if not self.page:
+            return
+        try:
+            # Press Escape twice
+            await self.page.keyboard.press("Escape")
+            await asyncio.sleep(0.2)
+            await self.page.keyboard.press("Escape")
+            await asyncio.sleep(0.2)
+
+            # Look for OK / Confirm / Close buttons on Binance popups
+            dismiss_selectors = [
+                'button:has-text("OK")',
+                'button:has-text("Confirm")',
+                'button:has-text("Got it")',
+                'button:has-text("Cancel")',
+                'button:has-text("Close")',
                 'button[aria-label="Close"]',
                 '.bn-modal-close',
                 'svg[class*="close"]',
-                'button:has-text("Done")',
-                'button:has-text("Confirm")',
                 'div[class*="close"]'
             ]
-            for sel in close_selectors:
-                close_btn = await self.page.query_selector(sel)
-                if close_btn and await close_btn.is_visible():
-                    await close_btn.click()
-                    await asyncio.sleep(0.3)
+            for sel in dismiss_selectors:
+                try:
+                    btns = await self.page.query_selector_all(sel)
+                    for btn in btns:
+                        if btn and await btn.is_visible():
+                            await btn.click()
+                            await asyncio.sleep(0.3)
+                except Exception:
+                    pass
+
+            # Force cleanup lingering backdrop elements if overlay stays stuck
+            await self.page.evaluate("""() => {
+                const modals = document.querySelectorAll('.bn-modal-mask, [class*="backdrop"], [class*="overlay"]');
+                modals.forEach(m => m.style.display = 'none');
+            }""")
         except Exception:
             pass
 
@@ -117,7 +150,7 @@ class BinanceRedeemer:
             'input[type="text"]'
         ]
 
-        # 1. First ensure "Receive" tab is active if present
+        # Ensure "Receive" tab is active if present
         receive_selectors = [
             'div[role="tab"]:has-text("Receive")',
             'button:has-text("Receive")',
@@ -133,16 +166,16 @@ class BinanceRedeemer:
             except Exception:
                 pass
 
-        # 2. Search for the input field
+        # Search for input field
         for sel in input_selectors:
             try:
-                el = await self.page.wait_for_selector(sel, state="visible", timeout=2500)
+                el = await self.page.wait_for_selector(sel, state="visible", timeout=2000)
                 if el:
                     return el
             except Exception:
                 continue
 
-        # 3. If not found, try dismissing any open modals and re-clicking Receive
+        # If not found, dismiss modals and try again
         await self._dismiss_modals()
         await asyncio.sleep(0.5)
 
@@ -158,8 +191,8 @@ class BinanceRedeemer:
 
     async def claim_crypto_box_code(self, code: str) -> Dict[str, Any]:
         """
-        Navigates to https://www.binance.com/en/my/wallet/account/payment/cryptobox
-        and inputs the 8-character code to claim the Red Packet.
+        Navigates to Binance Crypto Box page and claims the 8-character code.
+        Handles expired codes gracefully without getting stuck in loops.
         """
         if not self.page:
             await self.initialize()
@@ -168,23 +201,23 @@ class BinanceRedeemer:
         try:
             console.print(f"[bold magenta][➔] Opening Crypto Box page to claim code: [bold yellow]{code}[/bold yellow]...[/bold magenta]")
             
-            # Dismiss any previous modal before navigation/claim
+            # Dismiss any lingering popups from previous iterations
             await self._dismiss_modals()
 
-            # Navigate if not on target page, otherwise ensure clean state
+            # Ensure clean URL navigation
             if CRYPTO_BOX_URL not in self.page.url:
                 await self.page.goto(CRYPTO_BOX_URL, wait_until="domcontentloaded", timeout=15000)
-                await self._human_delay(1.5, 2.5)
+                await self._human_delay(1.2, 2.2)
             else:
-                # If already on the page, clear modal overlay and refresh if needed
+                await self._random_mouse_jitter()
                 await self._human_delay(0.5, 1.0)
 
             # Locate input field
             input_field = await self._find_crypto_box_input()
 
-            # If still not found, do a hard reload to reset SPA DOM state
+            # If still not found, do a hard reload to reset SPA state completely
             if not input_field:
-                console.print("[dim yellow][i] Refreshing page to reset Crypto Box form...[/dim yellow]")
+                console.print("[dim yellow][i] Resetting page state to locate Crypto Box form...[/dim yellow]")
                 await self.page.reload(wait_until="domcontentloaded", timeout=15000)
                 await self._human_delay(1.5, 2.5)
                 input_field = await self._find_crypto_box_input()
@@ -192,13 +225,13 @@ class BinanceRedeemer:
             if not input_field:
                 console.print("[bold red][!] Code input field not found on page.[/bold red]")
                 result["message"] = "Input field not found"
+                await self._dismiss_modals()
                 return result
 
-            # Click & enter code with human-like typing
+            # Click & enter code with human-like typing pauses
             await input_field.click()
             await self._human_delay(0.2, 0.4)
-            await input_field.fill("")
-            await input_field.fill(code)
+            await self._human_type(input_field, code)
             await self._human_delay(0.4, 0.8)
 
             # Find & click Claim button
@@ -223,13 +256,14 @@ class BinanceRedeemer:
             if not claim_btn:
                 console.print("[bold red][!] Claim button not found on page.[/bold red]")
                 result["message"] = "Claim button not found"
+                await self._dismiss_modals()
                 return result
 
             await claim_btn.click()
             console.print(f"[bold green][✓] Clicked Claim for code '{code}'. Awaiting response...[/bold green]")
             await self._human_delay(1.5, 2.5)
 
-            # Check for "Open" modal button
+            # 1. Check for "Open" modal button (valid un-claimed packet)
             open_selectors = [
                 'button:has-text("Open")',
                 'div[role="button"]:has-text("Open")',
@@ -237,46 +271,57 @@ class BinanceRedeemer:
             ]
             for o_sel in open_selectors:
                 try:
-                    open_btn = await self.page.wait_for_selector(o_sel, state="visible", timeout=3000)
+                    open_btn = await self.page.wait_for_selector(o_sel, state="visible", timeout=2000)
                     if open_btn:
                         await open_btn.click()
-                        await self._human_delay(1.0, 1.5)
+                        await self._human_delay(1.0, 1.8)
                         console.print(f"[bold gold1]🎉 [SUCCESS] Successfully opened Red Packet '{code}'![/bold gold1]")
                         result["status"] = "success"
                         result["message"] = "Red Packet opened"
                         await self._dismiss_modals()
+                        # Human pause before next code
+                        await self._human_delay(1.5, 3.0)
                         return result
                 except Exception:
                     pass
 
-            # Check for error or status toast/dialog messages
+            # 2. Check for Expired / Fully Claimed / Invalid status dialogs
             status_text = ""
-            modal = await self.page.query_selector('.bn-modal, [role="dialog"], .toast, div[class*="tip"]')
-            if modal:
-                status_text = await modal.inner_text()
+            try:
+                modal = await self.page.query_selector('.bn-modal, [role="dialog"], .toast, div[class*="tip"], div[class*="message"]')
+                if modal:
+                    status_text = await modal.inner_text()
+            except Exception:
+                pass
 
-            if "fully claimed" in status_text.lower():
-                console.print(f"[yellow][i] Code '{code}' has already been fully claimed by others.[/yellow]")
+            low_text = status_text.lower()
+            if "expired" in low_text or "fully claimed" in low_text or "has been claimed" in low_text:
+                console.print(f"[yellow][i] Code '{code}' is EXPIRED or fully claimed by others.[/yellow]")
                 result["status"] = "expired"
-                result["message"] = "Fully claimed"
-            elif "already claimed" in status_text.lower():
+                result["message"] = "Expired or fully claimed"
+            elif "already claimed" in low_text or "claimed it already" in low_text:
                 console.print(f"[yellow][i] You have already claimed code '{code}'.[/yellow]")
                 result["status"] = "already_claimed"
                 result["message"] = "Already claimed"
-            elif "invalid" in status_text.lower():
-                console.print(f"[red][!] Code '{code}' is invalid or expired.[/red]")
+            elif "invalid" in low_text:
+                console.print(f"[red][!] Code '{code}' is invalid.[/red]")
                 result["status"] = "invalid"
                 result["message"] = "Invalid code"
             else:
-                console.print(f"[bold green][✓] Code '{code}' submitted successfully.[/bold green]")
-                result["status"] = "submitted"
-                result["message"] = status_text or "Submitted"
+                console.print(f"[bold dim][i] Code '{code}' processed (Status: {status_text or 'Done'}).[/bold dim]")
+                result["status"] = "done"
+                result["message"] = status_text or "Done"
 
+            # Always dismiss popup dialogs so next iteration doesn't get stuck!
             await self._dismiss_modals()
+
+            # Human pause before next operation
+            await self._human_delay(1.8, 3.5)
 
         except Exception as e:
             console.print(f"[bold red][!] Error while claiming code {code}: {e}[/bold red]")
             result["message"] = str(e)
+            await self._dismiss_modals()
 
         return result
 
@@ -322,6 +367,7 @@ class BinanceRedeemer:
             if not input_field:
                 console.print("[yellow][!] Answer/Comment input field not found on post page.[/yellow]")
                 result["message"] = "Input not found"
+                await self._dismiss_modals()
                 return result
 
             await input_field.click()
@@ -331,7 +377,7 @@ class BinanceRedeemer:
             if tag_name == "div":
                 await input_field.evaluate(f"el => el.innerText = '{answer}'")
             else:
-                await input_field.fill(answer)
+                await self._human_type(input_field, answer)
 
             await self._human_delay(0.5, 1.0)
 
@@ -369,6 +415,7 @@ class BinanceRedeemer:
                         result["status"] = "success"
                         result["message"] = "Red Packet opened"
                         await self._dismiss_modals()
+                        await self._human_delay(1.8, 3.5)
                         return result
                 except Exception:
                     pass
@@ -380,10 +427,12 @@ class BinanceRedeemer:
                 result["message"] = "Submit button not found"
 
             await self._dismiss_modals()
+            await self._human_delay(1.8, 3.5)
 
         except Exception as e:
             console.print(f"[bold red][!] Error on Binance Square post: {e}[/bold red]")
             result["message"] = str(e)
+            await self._dismiss_modals()
 
         return result
 
