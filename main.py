@@ -1,4 +1,4 @@
-﻿import os
+import os
 import sys
 import json
 import asyncio
@@ -85,20 +85,32 @@ async def process_single_item(item_type: str, identifier: str, extra: str = ""):
     if item_type == "code":
         console.print(f"[bold gold1]⚡ Claiming Crypto Box Code: [bold white]{identifier}[/bold white][/bold gold1]")
         res = await redeemer.claim_crypto_box_code(identifier)
-        claimed_items.add(identifier)
-        save_claimed_cache(claimed_items)
+        status = res.get("status", "")
+        if status in ["success", "expired", "already_claimed", "invalid", "done"]:
+            claimed_items.add(identifier)
+            save_claimed_cache(claimed_items)
+        else:
+            console.print(f"[bold yellow][!] Code '{identifier}' was not cached ({status}: {res.get('message')}). It will be retried automatically.[/bold yellow]")
 
     elif item_type == "square":
         console.print(f"[bold gold1]⚡ Claiming Binance Square Post: [bold white]{identifier}[/bold white] (Answer: [bold yellow]{extra}[/bold yellow])[/bold gold1]")
         res = await redeemer.claim_binance_square_red_packet(identifier, extra)
-        claimed_items.add(identifier)
-        save_claimed_cache(claimed_items)
+        status = res.get("status", "")
+        if status in ["success", "submitted", "opened", "expired", "already_claimed", "invalid", "done"]:
+            claimed_items.add(identifier)
+            save_claimed_cache(claimed_items)
+        else:
+            console.print(f"[bold yellow][!] Square post '{identifier}' was not cached ({status}: {res.get('message')}). It can be retried.[/bold yellow]")
 
     elif item_type == "url":
         console.print(f"[bold gold1]⚡ Opening Red Packet Link: [bold white]{identifier}[/bold white][/bold gold1]")
         res = await redeemer.claim_red_packet_url(identifier)
-        claimed_items.add(identifier)
-        save_claimed_cache(claimed_items)
+        status = res.get("status", "")
+        if status in ["success", "opened", "expired", "already_claimed", "invalid", "done"]:
+            claimed_items.add(identifier)
+            save_claimed_cache(claimed_items)
+        else:
+            console.print(f"[bold yellow][!] Link '{identifier}' was not cached ({status}: {res.get('message')}).[/bold yellow]")
 
 def determine_sweep_limits(channel_name: str) -> tuple[int, int]:
     ch_lower = channel_name.lower()
