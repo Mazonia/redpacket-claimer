@@ -32,6 +32,7 @@ TARGET_CHANNELS = [c.strip() for c in TARGET_CHANNEL_RAW.split(",") if c.strip()
 
 if not API_ID or not API_HASH or not TARGET_CHANNELS:
     console.print("[bold red][!] ERROR: TELEGRAM_API_ID, TELEGRAM_API_HASH, and TARGET_CHANNEL must be set in your .env file.[/bold red]")
+    input("\nPress Enter to exit...")
     exit(1)
 
 CACHE_FILE = os.path.abspath("./claimed_cache.json")
@@ -100,11 +101,6 @@ async def process_single_item(item_type: str, identifier: str, extra: str = ""):
         save_claimed_cache(claimed_items)
 
 def determine_sweep_limits(channel_name: str) -> tuple[int, int]:
-    """
-    Returns (code_limit, question_limit) based on channel name.
-    Cryptobox Parser: 15 codes
-    Freerewardes: 10 codes, 5 questions
-    """
     ch_lower = channel_name.lower()
     if "cryptobox" in ch_lower or "parser" in ch_lower:
         return 15, 0
@@ -169,7 +165,6 @@ async def scan_and_claim_history(channel_entities: List[Any]):
             if not any(item["url"] == q["url"] for item in all_recent_questions):
                 all_recent_questions.append(q)
 
-    # Summary Table
     uncached_codes = [c for c in all_recent_codes if c not in claimed_items]
     history_table = Table(title=f"📋 Sweep Summary ({len(all_recent_codes)} Total Codes Found, {len(uncached_codes)} New To Claim)", show_header=True, header_style="bold magenta")
     history_table.add_column("#", style="dim", width=4)
@@ -191,13 +186,11 @@ async def scan_and_claim_history(channel_entities: List[Any]):
 
     console.print(history_table)
 
-    # Claim discovered codes
     if all_recent_codes:
         console.print(f"\n[bold cyan]▶ Attempting to claim {len(all_recent_codes)} historical codes...[/bold cyan]")
         for c in all_recent_codes:
             await process_single_item("code", c)
 
-    # Claim discovered questions
     if all_recent_questions:
         console.print(f"\n[bold cyan]▶ Attempting to claim {len(all_recent_questions)} historical questions...[/bold cyan]")
         for q in all_recent_questions:
@@ -273,3 +266,8 @@ if __name__ == "__main__":
         asyncio.run(main())
     except KeyboardInterrupt:
         console.print("\n[bold yellow][!] Bot stopped by user.[/bold yellow]")
+    except Exception as e:
+        console.print(f"\n[bold red][!] Unhandled Error: {e}[/bold red]")
+        import traceback
+        traceback.print_exc()
+        input("\nPress Enter to exit...")
