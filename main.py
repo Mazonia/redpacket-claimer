@@ -25,10 +25,13 @@ console = Console()
 API_ID = os.getenv("TELEGRAM_API_ID")
 API_HASH = os.getenv("TELEGRAM_API_HASH")
 PHONE = os.getenv("TELEGRAM_PHONE", "").strip()
-TARGET_CHANNEL = os.getenv("TARGET_CHANNEL", "").strip()
+TARGET_CHANNEL_RAW = os.getenv("TARGET_CHANNEL", "").strip()
 HEADLESS_MODE = os.getenv("HEADLESS", "false").lower() == "true"
 
-if not API_ID or not API_HASH or not TARGET_CHANNEL:
+# Support comma-separated list of target channels (e.g. "@Freerewardes, Cryptobox Parser")
+TARGET_CHANNELS = [c.strip() for c in TARGET_CHANNEL_RAW.split(",") if c.strip()]
+
+if not API_ID or not API_HASH or not TARGET_CHANNELS:
     console.print("[bold red][!] ERROR: TELEGRAM_API_ID, TELEGRAM_API_HASH, and TARGET_CHANNEL must be set in your .env file.[/bold red]")
     exit(1)
 
@@ -97,37 +100,44 @@ async def process_single_item(item_type: str, identifier: str, extra: str = ""):
         claimed_items.add(identifier)
         save_claimed_cache(claimed_items)
 
-async def scan_and_claim_history(channel_entity, code_limit: int = 100, question_limit: int = 5):
+async def scan_and_claim_history(channel_entities: List[Any], code_limit: int = 100, question_limit: int = 5):
+    channel_names = ", ".join([str(c) for c in TARGET_CHANNELS])
     console.print(Panel(
-        f"[bold cyan]🔍 Scanning channel history ({TARGET_CHANNEL}) for the last {code_limit} Red Packet codes and {question_limit} questions...[/bold cyan]",
-        title="[bold yellow]100-Code Historical Sweep Mode[/bold yellow]"
+        f"[bold cyan]🔍 Scanning history across {len(channel_entities)} channel(s) ({channel_names}) for up to {code_limit} Red Packet codes...[/bold cyan]",
+        title="[bold yellow]Multi-Channel 100-Code Historical Sweep Mode[/bold yellow]"
     ))
 
     recent_codes: List[str] = []
     recent_questions: List[Dict[str, str]] = []
 
-    async for msg in client.iter_messages(channel_entity, limit=800):
-        if not msg.raw_text:
-            continue
-        parsed = parse_telegram_message(msg.raw_text)
-
-        for c in parsed.get("codes", []):
-            if c not in recent_codes and len(recent_codes) < code_limit:
-                recent_codes.append(c)
-
-        sq_urls = parsed.get("square_urls", [])
-        answers = parsed.get("answers", [])
-        if sq_urls and answers:
-            url = sq_urls[0]
-            ans = answers[0]
-            if not any(q["url"] == url for q in recent_questions) and len(recent_questions) < question_limit:
-                recent_questions.append({"url": url, "answer": ans})
-
+    for entity in channel_entities:
         if len(recent_codes) >= code_limit and len(recent_questions) >= question_limit:
             break
+        try:
+            async for msg in client.iter_messages(entity, limit=400):
+                if not msg.raw_text:
+                    continue
+                parsed = parse_telegram_message(msg.raw_text)
+
+                for c in parsed.get("codes", []):
+                    if c not in recent_codes and len(recent_codes) < code_limit:
+                        recent_codes.append(c)
+
+                sq_urls = parsed.get("square_urls", [])
+                answers = parsed.get("answers", [])
+                if sq_urls and answers:
+                    url = sq_urls[0]
+                    ans = answers[0]
+                    if not any(q["url"] == url for q in recent_questions) and len(recent_questions) < question_limit:
+                        recent_questions.append({"url": url, "answer": ans})
+
+                if len(recent_codes) >= code_limit and len(recent_questions) >= question_limit:
+                    break
+        except Exception as e:
+            console.print(f"[yellow][!] Notice while scanning history from {entity}: {e}[/yellow]")
 
     uncached_codes = [c for c in recent_codes if c not in claimed_items]
-    history_table = Table(title=f"📋 Channel History Summary ({len(recent_codes)} Codes Found, {len(uncached_codes)} New To Claim)", show_header=True, header_style="bold magenta")
+    history_table = Table(title=f"📋 Multi-Channel History Summary ({len(recent_codes)} Codes Found, {len(uncached_codes)} New To Claim)", show_header=True, header_style="bold magenta")
     history_table.add_column("#", style="dim", width=4)
     history_table.add_column("Type", style="cyan", width=12)
     history_table.add_column("Item / Code / URL", style="bold white")
@@ -157,12 +167,18 @@ async def scan_and_claim_history(channel_entity, code_limit: int = 100, question
         for q in recent_questions:
             await process_single_item("square", q["url"], q["answer"])
 
-    console.print("\n[bold green][✓] Historical 100-code sweep completed![/bold green]\n")
+    console.print("\n[bold green][✓] Multi-channel 100-code sweep completed![/bold green]\n")
 
-@client.on(events.NewMessage(chats=TARGET_CHANNEL))
+@client.on(events.NewMessage(chats=TARGET_CHANNELS))
 async def live_message_handler(event):
+    try:
+        chat = await event.get_chat()
+        chat_name = getattr(chat, 'title', getattr(chat, 'username', 'Channel'))
+    except Exception:
+        chat_name = "Channel"
+
     message_text = event.raw_text
-    console.print(Panel(message_text, title=f"[bold green]📩 New Telegram Drop from {TARGET_CHANNEL}[/bold green]", border_style="green"))
+    console.print(Panel(message_text, title=f"[bold green]📩 New Drop from {chat_name}[/bold green]", border_style="green"))
     
     parsed = parse_telegram_message(message_text)
     codes = parsed.get("codes", [])
@@ -185,10 +201,10 @@ async def live_message_handler(event):
         await process_single_item("url", rp_url)
 
 async def main():
-    table = Table(title="🚀 Binance Red Packet & Feed Auto-Claimer (100-Code Sweep Mode)", show_header=True, header_style="bold magenta")
+    table = Table(title="🚀 Binance Red Packet & Feed Auto-Claimer (Multi-Channel Support)", show_header=True, header_style="bold magenta")
     table.add_column("Setting", style="dim", width=25)
     table.add_column("Value", style="bold green")
-    table.add_row("Target Channel", TARGET_CHANNEL)
+    table.add_row("Target Channels", ", ".join(TARGET_CHANNELS))
     table.add_row("Browser Mode", "Headless" if HEADLESS_MODE else "Visible (Headful)")
     table.add_row("Redemption URL", "https://www.binance.com/en/my/wallet/account/payment/cryptobox")
     table.add_row("Session Directory", "./user_data")
@@ -202,15 +218,18 @@ async def main():
     await client.start(phone=phone_callback)
     console.print(f"[bold green][✓] Telegram connected successfully![/bold green]")
 
-    try:
-        channel_entity = await client.get_entity(TARGET_CHANNEL)
-    except Exception as e:
-        console.print(f"[bold red][!] Error resolving channel {TARGET_CHANNEL}: {e}[/bold red]")
-        channel_entity = TARGET_CHANNEL
+    resolved_entities = []
+    for ch in TARGET_CHANNELS:
+        try:
+            entity = await client.get_entity(ch)
+            resolved_entities.append(entity)
+        except Exception as e:
+            console.print(f"[yellow][!] Notice: Could not resolve channel '{ch}' directly, using as raw handle: {e}[/yellow]")
+            resolved_entities.append(ch)
 
-    await scan_and_claim_history(channel_entity, code_limit=100, question_limit=5)
+    await scan_and_claim_history(resolved_entities, code_limit=100, question_limit=5)
 
-    console.print(f"[bold gold1]📡 100-code sweep finished! Bot is now actively listening for live drops from {TARGET_CHANNEL}... (Press Ctrl+C to stop)[/bold gold1]\n")
+    console.print(f"[bold gold1]📡 Multi-channel bot is actively listening on: {', '.join(TARGET_CHANNELS)}... (Press Ctrl+C to stop)[/bold gold1]\n")
     await client.run_until_disconnected()
 
 if __name__ == "__main__":
