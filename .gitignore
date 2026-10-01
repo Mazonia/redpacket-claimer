@@ -1,0 +1,34 @@
+# Environment variables & secrets
+.env
+.env.*
+!.env.example
+
+# Telegram session files
+*.session
+*.session-journal
+
+# Browser user data & saved login sessions
+user_data/
+user_data_*
+*.lock
+
+# Local cache & claimed history
+claimed_cache.json
+*.cache
+
+# Python bytecode & cache
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+env/
+venv/
+.venv/
+
+# Scratch & test scripts
+scratch/
+
+# Operating System files
+.DS_Store
+Thumbs.db
