@@ -39,6 +39,28 @@ if not API_ID or not API_HASH or not TARGET_CHANNELS:
 CACHE_FILE = os.path.abspath("./claimed_cache.json")
 MAX_FRESH_CODE_AGE_SECONDS = 180  # Codes older than 3 minutes are dead in public channels
 
+# Stepped reconnection backoff schedule for internet disconnections / Telegram unreachability
+# Ladder: 30s -> 1m -> 3m -> 5m -> 10m -> 20m -> 30m -> 45m
+RETRY_DELAYS = [30, 60, 180, 300, 600, 1200, 1800, 2700]
+
+
+def get_backoff_delay(attempt: int) -> int:
+    """Returns backoff delay in seconds for the given failed retry attempt (0-indexed)."""
+    if attempt < len(RETRY_DELAYS):
+        return RETRY_DELAYS[attempt]
+    return RETRY_DELAYS[-1]
+
+
+def format_delay_text(seconds: int) -> str:
+    """Formats delay in seconds into a human-friendly string (e.g. '30s', '1 min', '3 min')."""
+    if seconds < 60:
+        return f"{seconds}s"
+    minutes = seconds // 60
+    rem = seconds % 60
+    if rem == 0:
+        return f"{minutes} min"
+    return f"{minutes} min {rem}s"
+
 
 def load_claimed_cache() -> Set[str]:
     if os.path.exists(CACHE_FILE):
@@ -80,7 +102,14 @@ def phone_callback():
     return format_phone_number(raw_phone)
 
 
-client = TelegramClient('binance_session', int(API_ID), API_HASH)
+client = TelegramClient(
+    'binance_session',
+    int(API_ID),
+    API_HASH,
+    connection_retries=3,
+    retry_delay=1,
+    auto_reconnect=True
+)
 redeemer = BinanceRedeemer(headless=HEADLESS_MODE)
 claimed_items: Set[str] = load_claimed_cache()
 
@@ -304,6 +333,131 @@ async def live_message_handler(event):
         await process_single_item("url", rp_url)
 
 
+async def keepalive_watchdog():
+    """
+    Periodically checks MTProto connectivity to Telegram servers.
+    If the connection drops silently, disconnects client to trigger the stepped backoff ladder quickly.
+    """
+    from telethon.tl.functions import PingRequest
+    while True:
+        try:
+            await asyncio.sleep(25)
+            if client.is_connected():
+                try:
+                    await asyncio.wait_for(client(PingRequest(ping_id=0)), timeout=10.0)
+                except Exception as e:
+                    console.print(f"[dim yellow][!] Telegram keepalive ping timed out ({e}). Triggering reconnection ladder...[/dim yellow]")
+                    try:
+                        await client.disconnect()
+                    except Exception:
+                        pass
+        except asyncio.CancelledError:
+            break
+        except Exception:
+            pass
+
+
+async def connect_and_listen():
+    """
+    Manages Telegram client connection and live listening with stepped exponential backoff:
+    30s -> 1m -> 3m -> 5m -> 10m -> 20m -> 30m -> 45m
+    """
+    attempt = 0
+    resolved_entities = []
+
+    while True:
+        try:
+            if not client.is_connected():
+                console.print(f"\n[bold cyan][+] Connecting to Telegram...[/bold cyan]")
+                if not os.path.exists("binance_session.session"):
+                    await client.start(phone=phone_callback)
+                else:
+                    try:
+                        await client.connect()
+                        if not await client.is_user_authorized():
+                            await client.start(phone=phone_callback)
+                    except Exception:
+                        await client.start(phone=phone_callback)
+
+            try:
+                me = await client.get_me()
+                user_display = getattr(me, 'first_name', 'Authorized User') if me else 'Telegram User'
+            except Exception:
+                user_display = 'Telegram User'
+
+            if attempt > 0:
+                console.print(f"[bold green]🌐 [✓] Internet Restored! Reconnected to Telegram as [bold white]{user_display}[/bold white]![/bold green]\n")
+            else:
+                console.print(f"[bold green][✓] Telegram connected successfully as [bold white]{user_display}[/bold white]![/bold green]\n")
+
+            # Reset backoff attempt counter on successful connection
+            attempt = 0
+
+            # Resolve target channels
+            resolved_entities = []
+            for ch in TARGET_CHANNELS:
+                try:
+                    entity = await client.get_entity(ch)
+                    resolved_entities.append(entity)
+                except Exception as e:
+                    console.print(f"[yellow][!] Notice: Could not resolve channel '{ch}' directly, using raw handle: {e}[/yellow]")
+                    resolved_entities.append(ch)
+
+            # Catch-up history sweep for fresh drops received during downtime/start
+            await scan_and_claim_history(resolved_entities)
+
+            console.print(f"[bold gold1]📡 Bot is actively listening for live drops on: {', '.join(TARGET_CHANNELS)}... (Press Ctrl+C to stop)[/bold gold1]\n")
+
+            # Start keepalive watchdog task alongside run_until_disconnected
+            watchdog_task = asyncio.create_task(keepalive_watchdog())
+            try:
+                await client.run_until_disconnected()
+            finally:
+                watchdog_task.cancel()
+                try:
+                    await watchdog_task
+                except (asyncio.CancelledError, Exception):
+                    pass
+
+            console.print("[bold yellow][!] Telegram connection disconnected.[/bold yellow]")
+
+        except asyncio.CancelledError:
+            break
+        except KeyboardInterrupt:
+            raise
+        except Exception as e:
+            console.print(f"[bold red][!] Telegram connection error: {e}[/bold red]")
+
+        # Disconnection occurred - enter backoff ladder
+        delay = get_backoff_delay(attempt)
+        delay_formatted = format_delay_text(delay)
+        attempt_num = attempt + 1
+        ladder_summary = "30s → 1m → 3m → 5m → 10m → 20m → 30m → 45m"
+
+        console.print(Panel(
+            f"[bold red]🔌 TELEGRAM DISCONNECTED / UNREACHABLE[/bold red]\n"
+            f"[bold white]Internet is disconnected or Telegram servers cannot be reached.[/bold white]\n"
+            f"[bold yellow]Retrying in [bold cyan]{delay_formatted}[/bold cyan] (Attempt #{attempt_num}).[/bold yellow]\n"
+            f"[dim]Backoff Sequence: {ladder_summary}[/dim]",
+            title="[bold red]Network Reconnection Manager[/bold red]",
+            border_style="red"
+        ))
+
+        # Perform interactive live countdown wait
+        try:
+            with console.status(f"[bold yellow]⏳ Reconnecting to Telegram in {delay_formatted} (Attempt #{attempt_num})...[/bold yellow]", spinner="dots") as status:
+                for remaining in range(delay, 0, -1):
+                    if remaining % 60 == 0 or remaining in [45, 30, 15, 10, 5, 4, 3, 2, 1]:
+                        status.update(f"[bold yellow]⏳ Telegram offline. Reconnecting in {format_delay_text(remaining)} (Attempt #{attempt_num})...[/bold yellow]")
+                    await asyncio.sleep(1)
+        except asyncio.CancelledError:
+            break
+        except KeyboardInterrupt:
+            raise
+
+        attempt += 1
+
+
 async def main():
     is_locked, remaining_s, remaining_str = redeemer.is_locked_out()
     lockout_status = f"[bold red]Active ({remaining_str} remaining)[/bold red]" if is_locked else "[bold green]Clear (Ready to Claim)[/bold green]"
@@ -317,6 +471,7 @@ async def main():
     table.add_row("Session Directory", "./user_data")
     table.add_row("Cached Items", str(len(claimed_items)))
     table.add_row("Lockout Status", lockout_status)
+    table.add_row("Auto-Reconnect Ladder", "30s → 1m → 3m → 5m → 10m → 20m → 30m → 45m")
     console.print(table)
 
     if is_locked:
@@ -328,26 +483,20 @@ async def main():
             border_style="yellow"
         ))
 
-    await redeemer.initialize()
-    await redeemer.check_login_status()
-
-    console.print(f"\n[bold cyan][+] Connecting to Telegram...[/bold cyan]")
-    await client.start(phone=phone_callback)
-    console.print(f"[bold green][✓] Telegram connected successfully![/bold green]")
-
-    resolved_entities = []
-    for ch in TARGET_CHANNELS:
+    try:
+        await redeemer.initialize()
+        await redeemer.check_login_status()
+        await connect_and_listen()
+    finally:
         try:
-            entity = await client.get_entity(ch)
-            resolved_entities.append(entity)
-        except Exception as e:
-            console.print(f"[yellow][!] Notice: Could not resolve channel '{ch}' directly, using raw handle: {e}[/yellow]")
-            resolved_entities.append(ch)
-
-    await scan_and_claim_history(resolved_entities)
-
-    console.print(f"[bold gold1]📡 Bot is actively listening for live drops on: {', '.join(TARGET_CHANNELS)}... (Press Ctrl+C to stop)[/bold gold1]\n")
-    await client.run_until_disconnected()
+            if client.is_connected():
+                await client.disconnect()
+        except Exception:
+            pass
+        try:
+            await redeemer.close()
+        except Exception:
+            pass
 
 
 if __name__ == "__main__":

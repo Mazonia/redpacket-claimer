@@ -27,8 +27,14 @@ A high-performance, automated Python application that monitors Telegram channels
   - **Telegram Session**: Telethon runs locally on your machine. No tokens or messages are shared externally.
   - **Binance Session**: Uses Playwright's persistent Chromium browser context (`./user_data/`). Log into Binance **once** manually with 2FA; your session is preserved across runs.
 
+- **🌐 Stepped Internet & Telegram Auto-Reconnection**:
+  - Automatically recovers from internet outages and Telegram disconnections using a stepped backoff schedule:
+    `30s` ➔ `1 min` ➔ `3 min` ➔ `5 min` ➔ `10 min` ➔ `20 min` ➔ `30 min` ➔ `45 min`.
+  - Built-in MTProto keepalive watchdog detects silent dropped connections quickly.
+  - Automatically performs an intelligent channel history sweep upon reconnection to catch and claim any fresh drops (< 3 minutes old) that arrived while offline.
+
 - **🎨 Modern Rich Terminal UI**:
-  - Colored tables, live drop panels, lockout countdown status, and humanized stealth delays.
+  - Colored tables, live drop panels, lockout countdown status, reconnection spinners, and humanized stealth delays.
 
 ---
 
