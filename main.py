@@ -1,9 +1,10 @@
 import os
 import sys
 import json
+import time
 import asyncio
 from datetime import datetime, timezone
-from typing import Set, Dict, Any, List
+from typing import Set, Dict, Any, List, Optional
 from dotenv import load_dotenv
 from telethon import TelegramClient, events
 from rich.console import Console
@@ -37,6 +38,7 @@ if not API_ID or not API_HASH or not TARGET_CHANNELS:
     exit(1)
 
 CACHE_FILE = os.path.abspath("./claimed_cache.json")
+HELD_DROPS_FILE = os.path.abspath("./held_drops.json")
 MAX_FRESH_CODE_AGE_SECONDS = 180  # Codes older than 3 minutes are dead in public channels
 
 # Stepped reconnection backoff schedule for internet disconnections / Telegram unreachability
@@ -81,6 +83,47 @@ def save_claimed_cache(cache: Set[str]):
         console.print(f"[dim yellow][!] Warning: Could not save cache: {e}[/dim yellow]")
 
 
+def load_held_drops() -> List[Dict[str, Any]]:
+    if os.path.exists(HELD_DROPS_FILE):
+        try:
+            with open(HELD_DROPS_FILE, "r", encoding="utf-8") as f:
+                data = json.load(f)
+                if isinstance(data, list):
+                    return data
+        except Exception:
+            return []
+    return []
+
+
+def save_held_drops():
+    try:
+        with open(HELD_DROPS_FILE, "w", encoding="utf-8") as f:
+            json.dump(held_drops, f, indent=2)
+    except Exception as e:
+        console.print(f"[dim yellow][!] Warning: Could not save held drops cache: {e}[/dim yellow]")
+
+
+held_drops: List[Dict[str, Any]] = load_held_drops()
+
+
+def enqueue_held_drop(item_type: str, identifier: str, extra: str = "", timestamp: Optional[float] = None):
+    if identifier in claimed_items:
+        return
+    if any(item.get("identifier") == identifier for item in held_drops):
+        return
+
+    ts = timestamp if timestamp is not None else time.time()
+    drop = {
+        "type": item_type,
+        "identifier": identifier,
+        "extra": extra,
+        "timestamp": ts
+    }
+    held_drops.append(drop)
+    save_held_drops()
+    console.print(f"[bold yellow]📥 Held drop queued for auto-redemption post-lockout: {item_type.upper()} '{identifier}'[/bold yellow]")
+
+
 def format_phone_number(phone_input: str) -> str:
     phone_input = phone_input.strip().replace(" ", "").replace("-", "")
     if not phone_input.startswith("+"):
@@ -114,7 +157,7 @@ redeemer = BinanceRedeemer(headless=HEADLESS_MODE)
 claimed_items: Set[str] = load_claimed_cache()
 
 
-async def process_single_item(item_type: str, identifier: str, extra: str = ""):
+async def process_single_item(item_type: str, identifier: str, extra: str = "", timestamp: Optional[float] = None):
     if identifier in claimed_items:
         console.print(f"[dim]↷ Skipping already cached {item_type}: {identifier}[/dim]")
         return
@@ -122,8 +165,11 @@ async def process_single_item(item_type: str, identifier: str, extra: str = ""):
     # Check if account is on active Binance cooldown
     is_locked, remaining_s, remaining_str = redeemer.is_locked_out()
     if is_locked:
-        console.print(f"[bold red]⏳ Account on Binance Lockout! Cannot claim '{identifier}'. Time remaining: {remaining_str}. (Skipped)[/bold red]")
+        console.print(f"[bold red]⏳ Account on Binance Lockout ({remaining_str} remaining). Cannot claim '{identifier}' now — holding in queue.[/bold red]")
+        enqueue_held_drop(item_type, identifier, extra, timestamp=timestamp)
         return
+
+    ts = timestamp if timestamp is not None else time.time()
 
     if item_type == "code":
         console.print(f"[bold gold1]⚡ Claiming Crypto Box Code: [bold white]{identifier}[/bold white][/bold gold1]")
@@ -137,11 +183,12 @@ async def process_single_item(item_type: str, identifier: str, extra: str = ""):
             rem_str = redeemer.get_lockout_remaining_str()
             console.print(Panel(
                 f"[bold red]🚫 BINANCE RATE LIMIT / LOCKOUT ACTIVATED[/bold red]\n"
-                f"[bold white]Code '[bold yellow]{identifier}[/bold yellow]' was not claimed and will NOT be cached.[/bold white]\n"
+                f"[bold white]Code '[bold yellow]{identifier}[/bold yellow]' was queued for auto-redemption when lockout expires.[/bold white]\n"
                 f"[bold yellow]Bot is pausing claims for {rem_str} to protect your account.[/bold yellow]",
                 title="[bold red]Rate Limit Alert[/bold red]",
                 border_style="red"
             ))
+            enqueue_held_drop(item_type, identifier, extra, timestamp=ts)
         else:
             console.print(f"[bold yellow][!] Code '{identifier}' returned status '{status}' ({res.get('message')}). Not cached.[/bold yellow]")
 
@@ -155,7 +202,8 @@ async def process_single_item(item_type: str, identifier: str, extra: str = ""):
             save_claimed_cache(claimed_items)
         elif status == "rate_limited":
             rem_str = redeemer.get_lockout_remaining_str()
-            console.print(f"[bold red]🚫 Lockout active ({rem_str} remaining). Square post '{identifier}' held.[/bold red]")
+            console.print(f"[bold red]🚫 Lockout active ({rem_str} remaining). Square post '{identifier}' held in queue.[/bold red]")
+            enqueue_held_drop(item_type, identifier, extra, timestamp=ts)
         else:
             console.print(f"[bold yellow][!] Square post '{identifier}' returned '{status}'. Not cached.[/bold yellow]")
 
@@ -169,7 +217,8 @@ async def process_single_item(item_type: str, identifier: str, extra: str = ""):
             save_claimed_cache(claimed_items)
         elif status == "rate_limited":
             rem_str = redeemer.get_lockout_remaining_str()
-            console.print(f"[bold red]🚫 Lockout active ({rem_str} remaining). Link '{identifier}' held.[/bold red]")
+            console.print(f"[bold red]🚫 Lockout active ({rem_str} remaining). Link '{identifier}' held in queue.[/bold red]")
+            enqueue_held_drop(item_type, identifier, extra, timestamp=ts)
         else:
             console.print(f"[bold yellow][!] Link '{identifier}' returned '{status}'. Not cached.[/bold yellow]")
 
@@ -294,8 +343,10 @@ async def live_message_handler(event):
     message_text = event.raw_text
     console.print(Panel(message_text, title=f"[bold green]📩 New Drop from {chat_name}[/bold green]", border_style="green"))
 
+    msg_timestamp = time.time()
     # Freshness verification
     if event.message and event.message.date:
+        msg_timestamp = event.message.date.timestamp()
         now = datetime.now(timezone.utc)
         age = (now - event.message.date).total_seconds()
         if age > MAX_FRESH_CODE_AGE_SECONDS:
@@ -316,21 +367,15 @@ async def live_message_handler(event):
         console.print("[dim][i] Post received, but no red packet codes or reward links found.[/dim]\n")
         return
 
-    # Check lockout before dispatching
-    is_locked, remaining_s, remaining_str = redeemer.is_locked_out()
-    if is_locked:
-        console.print(f"[bold red]⏳ Account currently in Binance lockout ({remaining_str} remaining). Holding live drops.[/bold red]\n")
-        return
-
     for sq_url in square_urls:
         ans = answers[0] if answers else ""
-        await process_single_item("square", sq_url, ans)
+        await process_single_item("square", sq_url, ans, timestamp=msg_timestamp)
 
     for code in codes:
-        await process_single_item("code", code)
+        await process_single_item("code", code, timestamp=msg_timestamp)
 
     for rp_url in red_packet_urls:
-        await process_single_item("url", rp_url)
+        await process_single_item("url", rp_url, timestamp=msg_timestamp)
 
 
 async def keepalive_watchdog():
@@ -458,6 +503,68 @@ async def connect_and_listen():
         attempt += 1
 
 
+async def lockout_queue_monitor():
+    """
+    Background worker that continuously monitors Binance lockout status.
+    Once lockout expires, automatically processes all queued held drops that are still fresh.
+    """
+    while True:
+        try:
+            await asyncio.sleep(2)
+            if not held_drops:
+                continue
+
+            is_locked, remaining_s, remaining_str = redeemer.is_locked_out()
+            if is_locked:
+                continue
+
+            # Lockout cleared and we have held drops!
+            drops_to_process = list(held_drops)
+            console.print(Panel(
+                f"[bold green]🔓 BINANCE LOCKOUT EXPIRED / CLEARED![/bold green]\n"
+                f"[bold white]Auto-entering {len(drops_to_process)} held drop(s) queued during lockout...[/bold white]",
+                title="[bold green]Auto-Redeeming Held Drops[/bold green]",
+                border_style="green"
+            ))
+
+            now_ts = time.time()
+            for item in drops_to_process:
+                # Remove from held_drops list and save state
+                if item in held_drops:
+                    held_drops.remove(item)
+                    save_held_drops()
+
+                item_type = item.get("type", "code")
+                identifier = item.get("identifier", "")
+                extra = item.get("extra", "")
+                ts = item.get("timestamp", now_ts)
+
+                if identifier in claimed_items:
+                    continue
+
+                age = now_ts - ts
+                if age > MAX_FRESH_CODE_AGE_SECONDS:
+                    console.print(f"[dim yellow]↷ Skipping held {item_type} '{identifier}' ({int(age)}s old) — expired during lockout to protect account.[/dim yellow]")
+                    claimed_items.add(identifier)
+                    save_claimed_cache(claimed_items)
+                    continue
+
+                console.print(f"[bold cyan]⚡ Auto-entering held drop ({int(age)}s old): [bold white]{identifier}[/bold white][/bold cyan]")
+                await process_single_item(item_type, identifier, extra, timestamp=ts)
+
+                # If processing this drop triggered lockout again, pause remaining
+                is_locked_now, _, rem_str_now = redeemer.is_locked_out()
+                if is_locked_now:
+                    console.print(f"[bold red]⏳ Re-entered Binance lockout ({rem_str_now} remaining). Remaining held drops will stay queued.[/bold red]")
+                    break
+
+        except asyncio.CancelledError:
+            break
+        except Exception as e:
+            console.print(f"[dim yellow][!] Notice in lockout queue monitor: {e}[/dim yellow]")
+            await asyncio.sleep(5)
+
+
 async def main():
     is_locked, remaining_s, remaining_str = redeemer.is_locked_out()
     lockout_status = f"[bold red]Active ({remaining_str} remaining)[/bold red]" if is_locked else "[bold green]Clear (Ready to Claim)[/bold green]"
@@ -470,6 +577,7 @@ async def main():
     table.add_row("Redemption URL", "https://www.binance.com/en/my/wallet/account/payment/cryptobox")
     table.add_row("Session Directory", "./user_data")
     table.add_row("Cached Items", str(len(claimed_items)))
+    table.add_row("Queued Held Drops", f"{len(held_drops)} item(s)")
     table.add_row("Lockout Status", lockout_status)
     table.add_row("Auto-Reconnect Ladder", "30s → 1m → 3m → 5m → 10m → 20m → 30m → 45m")
     console.print(table)
@@ -478,16 +586,23 @@ async def main():
         console.print(Panel(
             f"[bold red]⚠️ ACTIVE BINANCE RATE LIMIT DETECTED[/bold red]\n"
             f"[bold white]Your Binance account is on cooldown ({remaining_str} remaining).[/bold white]\n"
-            f"[bold yellow]The bot is running in stealth listener mode. Claims will automatically resume once the lockout expires.[/bold yellow]",
+            f"[bold yellow]The bot is running in stealth listener mode. Drops will be queued and auto-redeemed once lockout expires.[/bold yellow]",
             title="[bold yellow]Protection Mode Active[/bold yellow]",
             border_style="yellow"
         ))
+
+    lockout_task = asyncio.create_task(lockout_queue_monitor())
 
     try:
         await redeemer.initialize()
         await redeemer.check_login_status()
         await connect_and_listen()
     finally:
+        lockout_task.cancel()
+        try:
+            await lockout_task
+        except (asyncio.CancelledError, Exception):
+            pass
         try:
             if client.is_connected():
                 await client.disconnect()
