@@ -15,18 +15,20 @@ A high-performance, automated Python application that monitors Telegram channels
   - Extracts answers enclosed in `❕...❕` (e.g. `𝑨𝒏𝒔𝒘𝒆𝒓 :❕20.8k❕`).
   - Automatically opens the post, fills the answer into the answer/comment box, submits, and claims the reward!
 
-- **🕰️ Historical Catch-Up Mode**:
-  - On launch, automatically scans the channel's recent history to retrieve and claim the **last 5 codes** and **last 5 questions** you might have missed before transitioning into live mode.
+- **🛡️ Intelligent Anti-Ban & Rate Limit Protection**:
+  - **Live Lockout Detection & Time Parsing**: Automatically extracts exact Binance cooldown durations (e.g., *"Please try again in 04 hour(s) and 19 minute(s)"*), pauses claims, and persists lockout timestamps to prevent ban extensions.
+  - **Circuit Breaker System**: Automatically halts claims for 75 seconds if multiple consecutive dead/invalid codes are encountered, avoiding anti-bruteforce account lockouts.
+  - **Smart Historical Freshness Gating**: Only attempts to claim drops younger than 3 minutes; older historical codes are automatically pre-cached without submitting dead codes to Binance.
 
 - **💾 Local Cache & Duplicate Prevention**:
-  - Keeps a local `claimed_cache.json` to prevent re-submitting previously processed codes or triggering rate limits.
+  - Keeps a local `claimed_cache.json` to prevent re-submitting previously processed codes.
 
 - **🔐 100% Private & Persistent Session**:
   - **Telegram Session**: Telethon runs locally on your machine. No tokens or messages are shared externally.
   - **Binance Session**: Uses Playwright's persistent Chromium browser context (`./user_data/`). Log into Binance **once** manually with 2FA; your session is preserved across runs.
 
 - **🎨 Modern Rich Terminal UI**:
-  - Colored tables, live drop panels, status logs, and humanized stealth delays.
+  - Colored tables, live drop panels, lockout countdown status, and humanized stealth delays.
 
 ---
 
@@ -34,9 +36,9 @@ A high-performance, automated Python application that monitors Telegram channels
 
 ```
 binance-auto-claimer/
-├── main.py            # Orchestrator: Historical catch-up, live Telegram listener & claim dispatcher
+├── main.py            # Orchestrator: Freshness filtering, Telegram listener & dispatcher
 ├── parser.py          # Regex parser: Isolates 8-char codes, Binance Square links & answers
-├── redemption.py      # Playwright automation engine: Handles UI navigation, typing, and claiming
+├── redemption.py      # Playwright engine: Lockout tracker, circuit breaker & claiming
 ├── requirements.txt   # Python dependencies
 ├── .env.example       # Template configuration file
 ├── .gitignore         # Protects credentials, session files, and browser cookies
@@ -78,8 +80,8 @@ python -m playwright install chromium
    # Your Telegram phone number in international format (+...)
    TELEGRAM_PHONE=+1234567890
 
-   # Target Channel to monitor
-   TARGET_CHANNEL=@your_channel_name
+   # Target Channels to monitor
+   TARGET_CHANNEL=@channel_one, @channel_two
 
    # Playwright Configuration
    HEADLESS=false
@@ -99,15 +101,15 @@ python main.py
 1. **Telegram Authorization**: Telethon will connect using your phone number and prompt for the 5-digit code sent to your Telegram app. This generates your local `binance_session.session`.
 2. **Binance Session**: Chromium will open to `https://www.binance.com/en/my/wallet/account/payment/cryptobox`. Log in manually (solve 2FA). Your session is saved to `./user_data/` so you won't need to log in again.
 3. **Catch-Up & Live Monitoring**:
-   - The bot scans the channel for the last 5 codes and last 5 questions and claims them.
-   - It then remains running in the background, claiming new drops within seconds!
+   - The bot scans channel history for fresh drops (< 3 minutes old) while pre-caching old drops.
+   - It then remains running in the background, claiming new drops with stealth delays and circuit breaker protection!
 
 ---
 
-## 🛡️ Security Best Practices
+## 🛡️ Security & Anti-Detection Best Practices
 
 - **Never commit `.env` or `*.session` files**: They contain your sensitive credentials. The repository includes a preconfigured `.gitignore` to prevent leaks.
-- **Stealth & Rate Limits**: The script incorporates randomized delays (`_human_delay`) and browser flags to mimic natural user behavior and protect against bot detection.
+- **Stealth & Rate Limits**: Incorporates randomized delays (`_human_delay`), adaptive typing speed, and intelligent circuit breakers to emulate human user interaction.
 
 ---
 

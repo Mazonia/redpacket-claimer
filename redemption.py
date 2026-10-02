@@ -1,15 +1,58 @@
 import os
+import re
+import json
+import time
 import asyncio
 import random
-from typing import Optional, List, Dict, Any
+from typing import Optional, List, Dict, Any, Tuple
 from playwright.async_api import async_playwright, BrowserContext, Page
 from rich.console import Console
 
 console = Console()
 USER_DATA_DIR = os.path.abspath("./user_data")
+LOCKOUT_STATE_FILE = os.path.abspath("./user_data/lockout_state.json")
 
 # Binance Official Crypto Box Redemption URL
 CRYPTO_BOX_URL = "https://www.binance.com/en/my/wallet/account/payment/cryptobox"
+
+
+def parse_lockout_duration(text: str) -> int:
+    """
+    Extracts hours, minutes, and seconds from Binance rate limit / lockout text.
+    E.g. 'Please try again in 04 hour(s) and 19 minute(s).' -> 15540 seconds
+    """
+    hours = 0
+    minutes = 0
+    seconds = 0
+
+    h_match = re.search(r'(\d+)\s*hour', text, re.IGNORECASE)
+    m_match = re.search(r'(\d+)\s*(?:minute|min)', text, re.IGNORECASE)
+    s_match = re.search(r'(\d+)\s*(?:second|sec)', text, re.IGNORECASE)
+
+    if h_match:
+        hours = int(h_match.group(1))
+    if m_match:
+        minutes = int(m_match.group(1))
+    if s_match:
+        seconds = int(s_match.group(1))
+
+    total = hours * 3600 + minutes * 60 + seconds
+    # Default to 4 hours (14400s) if a lockout is triggered without explicit numbers
+    return total if total > 0 else 14400
+
+
+def format_duration(seconds: int) -> str:
+    """Formats seconds into human-readable duration string."""
+    h = seconds // 3600
+    m = (seconds % 3600) // 60
+    s = seconds % 60
+    if h > 0:
+        return f"{h:02d} hour(s) and {m:02d} minute(s)"
+    elif m > 0:
+        return f"{m:02d} minute(s) and {s:02d} second(s)"
+    else:
+        return f"{s:02d} second(s)"
+
 
 class BinanceRedeemer:
     def __init__(self, headless: bool = False):
@@ -18,6 +61,82 @@ class BinanceRedeemer:
         self.page: Optional[Page] = None
         self._pw = None
         self._lock = asyncio.Lock()
+        self.consecutive_failures = 0
+        self.lockout_until = self._load_lockout()
+
+    def _load_lockout(self) -> float:
+        """Loads saved lockout expiration timestamp from disk if active."""
+        if os.path.exists(LOCKOUT_STATE_FILE):
+            try:
+                with open(LOCKOUT_STATE_FILE, "r", encoding="utf-8") as f:
+                    data = json.load(f)
+                    until = data.get("lockout_until", 0.0)
+                    if until > time.time():
+                        return float(until)
+            except Exception:
+                pass
+        return 0.0
+
+    def _save_lockout(self, until: float, reason: str = ""):
+        """Persists lockout expiration timestamp to disk."""
+        try:
+            os.makedirs(os.path.dirname(LOCKOUT_STATE_FILE), exist_ok=True)
+            with open(LOCKOUT_STATE_FILE, "w", encoding="utf-8") as f:
+                json.dump({
+                    "lockout_until": until,
+                    "reason": reason,
+                    "updated_at": time.time()
+                }, f, indent=2)
+        except Exception:
+            pass
+
+    def set_lockout(self, duration_seconds: float, reason: str = ""):
+        """Activates lockout cooldown timer and saves state."""
+        self.lockout_until = time.time() + duration_seconds + 30  # Add 30s buffer
+        self._save_lockout(self.lockout_until, reason)
+
+    def is_locked_out(self) -> Tuple[bool, int, str]:
+        """
+        Checks if the account is currently on Binance lockout / rate limit cooldown.
+        Returns (is_locked, remaining_seconds, human_readable_time).
+        """
+        if self.lockout_until > time.time():
+            remaining = int(self.lockout_until - time.time())
+            return True, remaining, format_duration(remaining)
+        return False, 0, ""
+
+    def get_lockout_remaining_str(self) -> str:
+        """Returns remaining lockout duration string or empty string if not locked out."""
+        is_locked, _, rem_str = self.is_locked_out()
+        return rem_str if is_locked else ""
+
+    def clear_lockout(self):
+        """Clears active lockout state."""
+        self.lockout_until = 0.0
+        try:
+            if os.path.exists(LOCKOUT_STATE_FILE):
+                os.remove(LOCKOUT_STATE_FILE)
+        except Exception:
+            pass
+
+    async def _handle_circuit_breaker(self):
+        """
+        Increments failure counter. If 4 consecutive expired/invalid codes occur,
+        triggers a 75-second protective pause to prevent Binance bruteforce lockouts.
+        """
+        self.consecutive_failures += 1
+        if self.consecutive_failures >= 4:
+            cooldown_time = 75
+            console.print(f"\n[bold yellow]🛡️ [CIRCUIT BREAKER] {self.consecutive_failures} consecutive dead/invalid codes detected![/bold yellow]")
+            console.print(f"[bold yellow]🛡️ Pausing claims for {cooldown_time}s to protect your account against Binance anti-bruteforce lockouts...[/bold yellow]\n")
+            await asyncio.sleep(cooldown_time)
+            self.consecutive_failures = 0
+        else:
+            await self._human_delay(2.5, 4.0)
+
+    def _reset_circuit_breaker(self):
+        """Resets consecutive failures counter upon any successful claim."""
+        self.consecutive_failures = 0
 
     async def _human_delay(self, min_s: float = 0.5, max_s: float = 1.5):
         """Randomized delay to emulate natural human interaction."""
@@ -265,13 +384,195 @@ class BinanceRedeemer:
 
         return None
 
+    async def _extract_page_feedback(self) -> Dict[str, Any]:
+        """
+        Examines inline form error messages, dialogs, modals, toasts, and DOM text
+        to accurately classify the result of a redemption attempt.
+        """
+        if not self.page:
+            return {"status": "no_page", "message": "No active browser page"}
+
+        try:
+            raw_feedback = await self.page.evaluate("""() => {
+                const texts = [];
+                
+                // 1. Check known feedback / form error selector containers
+                const selectors = [
+                    '.bn-form-item-explain',
+                    '.bn-form-item-error',
+                    '.bn-feedback',
+                    '.toast',
+                    '.bn-modal',
+                    '.openbox',
+                    '[role="alert"]',
+                    '[role="dialog"]',
+                    'div[class*="error" i]',
+                    'div[class*="feedback" i]',
+                    'div[class*="tip" i]',
+                    'div[class*="notice" i]',
+                    'div[class*="message" i]',
+                    'div[class*="warning" i]',
+                    'div[class*="Toast" i]'
+                ];
+                
+                for (const sel of selectors) {
+                    try {
+                        const elements = document.querySelectorAll(sel);
+                        elements.forEach(el => {
+                            if (el && el.innerText && el.innerText.trim()) {
+                                texts.push(el.innerText.trim());
+                            }
+                        });
+                    } catch (e) {}
+                }
+                
+                // 2. Check input container and its parents (captures inline form validation errors)
+                const input = document.querySelector('input[type="text"], input[name="code"], input[placeholder*="code" i], input[placeholder*="Crypto" i]');
+                if (input) {
+                    let parent = input.parentElement;
+                    for (let i = 0; i < 5 && parent; i++) {
+                        const pText = (parent.innerText || '').trim();
+                        if (pText && (
+                            pText.includes('exceeded') || 
+                            pText.includes('attempt') || 
+                            pText.includes('try again') || 
+                            pText.includes('invalid') || 
+                            pText.includes('expired') || 
+                            pText.includes('claimed') || 
+                            pText.includes('exist')
+                        )) {
+                            texts.push(pText);
+                        }
+                        parent = parent.parentElement;
+                    }
+                }
+                
+                // 3. Fallback body check for maximum attempt phrases
+                const bodyText = document.body ? (document.body.innerText || '') : '';
+                if (bodyText.includes('exceeded the maximum attempts') || bodyText.includes('maximum attempts for entering')) {
+                    texts.push(bodyText);
+                }
+                
+                return texts.join('\\n');
+            }""")
+        except Exception:
+            raw_feedback = ""
+
+        text_lower = raw_feedback.lower()
+
+        # 1. Rate Limit / Maximum Attempts Lockout
+        if (
+            "exceeded the maximum attempts" in text_lower or
+            "maximum attempts" in text_lower or
+            "try again in" in text_lower or
+            "too many attempts" in text_lower or
+            "frequency limit" in text_lower or
+            "temporarily restricted" in text_lower or
+            "rate limit" in text_lower
+        ):
+            lockout_msg = ""
+            for line in raw_feedback.split("\n"):
+                l_low = line.lower()
+                if "exceeded" in l_low or "attempts" in l_low or "try again" in l_low or "limit" in l_low:
+                    lockout_msg = line.strip()
+                    break
+            if not lockout_msg:
+                lockout_msg = raw_feedback[:120].strip()
+
+            duration = parse_lockout_duration(raw_feedback)
+            self.set_lockout(duration, lockout_msg)
+
+            return {
+                "status": "rate_limited",
+                "message": lockout_msg,
+                "retry_after": duration
+            }
+
+        # 2. Expired / Fully Claimed
+        if (
+            "expired" in text_lower or
+            "fully claimed" in text_lower or
+            "has been claimed" in text_lower or
+            "all rewards have been claimed" in text_lower or
+            "this crypto box has ended" in text_lower or
+            "crypto box has ended" in text_lower or
+            "the crypto box is empty" in text_lower or
+            "box is empty" in text_lower or
+            "already ended" in text_lower
+        ):
+            return {
+                "status": "expired",
+                "message": "Expired or fully claimed"
+            }
+
+        # 3. Already Claimed
+        if (
+            "already claimed" in text_lower or
+            "claimed it already" in text_lower or
+            "cannot claim twice" in text_lower or
+            "you have already" in text_lower
+        ):
+            return {
+                "status": "already_claimed",
+                "message": "Already claimed"
+            }
+
+        # 4. Invalid Code
+        if (
+            "invalid" in text_lower or
+            "does not exist" in text_lower or
+            "incorrect code" in text_lower or
+            "please enter a valid code" in text_lower or
+            "code not found" in text_lower
+        ):
+            return {
+                "status": "invalid",
+                "message": "Invalid code"
+            }
+
+        # 5. Server Error
+        if (
+            "something went wrong" in text_lower or
+            "500" in text_lower or
+            "internal server error" in text_lower or
+            "service unavailable" in text_lower
+        ):
+            return {
+                "status": "server_error",
+                "message": "Binance server error"
+            }
+
+        # 6. Unrecognized / Unknown text
+        if raw_feedback.strip():
+            clean_snippet = raw_feedback.replace('\n', ' ').strip()
+            return {
+                "status": "unknown",
+                "message": clean_snippet[:100]
+            }
+
+        return {
+            "status": "no_response",
+            "message": "No response text detected"
+        }
+
     async def claim_crypto_box_code(self, code: str, max_attempts: int = 3) -> Dict[str, Any]:
         """
         Navigates to Binance Crypto Box page and claims the 8-character code.
         Guaranteed single-threaded execution using asyncio.Lock to prevent typing collisions.
-        Auto-refreshes and retries automatically if a 500 error occurs.
+        Includes full rate-limit lockout detection, circuit breaker, and automatic 500 error recovery.
         """
         async with self._lock:
+            # Check lockout before making any browser calls
+            is_locked, remaining_s, remaining_str = self.is_locked_out()
+            if is_locked:
+                console.print(f"[bold red]⏳ Account on Binance Lockout! Cannot claim '{code}'. Time remaining: {remaining_str}. (Skipping)[/bold red]")
+                return {
+                    "code": code,
+                    "status": "rate_limited",
+                    "message": f"Binance lockout active: {remaining_str} remaining",
+                    "retry_after": remaining_s
+                }
+
             if not self.page:
                 await self.initialize()
 
@@ -313,6 +614,15 @@ class BinanceRedeemer:
 
                     if needs_reload or await self._is_500_error_page():
                         await self._recover_from_500_error(CRYPTO_BOX_URL)
+
+                    # Check if page already displays active lockout banner
+                    pre_fb = await self._extract_page_feedback()
+                    if pre_fb.get("status") == "rate_limited":
+                        console.print(f"[bold red]🚫 BINANCE LOCKOUT DETECTED ON PAGE: {pre_fb['message']}[/bold red]")
+                        result["status"] = "rate_limited"
+                        result["message"] = pre_fb["message"]
+                        result["retry_after"] = pre_fb.get("retry_after")
+                        return result
 
                     # Locate input field
                     input_field = await self._find_crypto_box_input()
@@ -427,48 +737,66 @@ class BinanceRedeemer:
                                 console.print(f"[bold gold1]🎉 [SUCCESS] Successfully opened Red Packet '{code}'![/bold gold1]")
                                 result["status"] = "success"
                                 result["message"] = "Red Packet opened"
+                                self._reset_circuit_breaker()
                                 opened = True
                                 break
                         except Exception:
                             pass
 
                     if not opened:
-                        # 2. Check for Expired / Fully Claimed / Invalid status dialogs
-                        status_text = ""
-                        try:
-                            modal = await self.page.query_selector('.bn-modal, .openbox, [role="dialog"], .toast, div[class*="tip"], div[class*="message"]')
-                            if modal:
-                                status_text = await modal.inner_text()
-                        except Exception:
-                            pass
+                        # 2. Check for feedback (Rate limit / Expired / Already Claimed / Invalid)
+                        fb = await self._extract_page_feedback()
+                        status = fb.get("status", "unknown")
+                        fb_msg = fb.get("message", "")
 
-                        low_text = status_text.lower()
-                        if "expired" in low_text or "fully claimed" in low_text or "has been claimed" in low_text:
+                        if status == "rate_limited":
+                            rem_str = self.get_lockout_remaining_str()
+                            console.print(f"[bold red]🚫 BINANCE RATE LIMIT DETECTED: {fb_msg}[/bold red]")
+                            console.print(f"[bold red]⏳ Auto-claimer is paused. Cooldown expires in: {rem_str}[/bold red]")
+                            result["status"] = "rate_limited"
+                            result["message"] = fb_msg
+                            result["retry_after"] = fb.get("retry_after")
+                            await self._dismiss_modals()
+                            return result
+
+                        elif status == "expired":
                             console.print(f"[yellow][i] Code '{code}' is EXPIRED or fully claimed by others.[/yellow]")
                             result["status"] = "expired"
                             result["message"] = "Expired or fully claimed"
-                        elif "already claimed" in low_text or "claimed it already" in low_text:
+                            await self._handle_circuit_breaker()
+
+                        elif status == "already_claimed":
                             console.print(f"[yellow][i] You have already claimed code '{code}'.[/yellow]")
                             result["status"] = "already_claimed"
                             result["message"] = "Already claimed"
-                        elif "invalid" in low_text:
+                            await self._human_delay(1.0, 2.0)
+
+                        elif status == "invalid":
                             console.print(f"[red][!] Code '{code}' is invalid.[/red]")
                             result["status"] = "invalid"
                             result["message"] = "Invalid code"
-                        else:
-                            console.print(f"[bold dim][i] Code '{code}' processed ({status_text[:60] if status_text else 'Done'}).[/bold dim]")
-                            result["status"] = "done"
-                            result["message"] = status_text or "Done"
+                            await self._handle_circuit_breaker()
 
-                    # Always dismiss popup dialogs immediately so the next code has a clean canvas
+                        elif status == "server_error":
+                            console.print(f"[bold yellow][!] Server error response for code '{code}'.[/bold yellow]")
+                            result["status"] = "server_error"
+                            result["message"] = fb_msg
+
+                        else:
+                            console.print(f"[bold dim][i] Code '{code}' response: {fb_msg if fb_msg else 'Done'}.[/bold dim]")
+                            result["status"] = "unknown"
+                            result["message"] = fb_msg or "Done"
+
+                    # Dismiss popup dialogs immediately so the next code has a clean canvas
                     await self._dismiss_modals()
 
                     # Ensure page is NOT left on a 500 error screen
                     if await self._is_500_error_page():
                         await self._recover_from_500_error(CRYPTO_BOX_URL)
 
-                    # Human pause before next code
-                    await self._human_delay(1.5, 3.0)
+                    # Natural stealth pause before next code
+                    if result["status"] == "success":
+                        await self._human_delay(1.5, 3.0)
                     return result
 
                 except Exception as e:
@@ -497,6 +825,17 @@ class BinanceRedeemer:
         Guaranteed single-threaded execution using asyncio.Lock.
         """
         async with self._lock:
+            is_locked, remaining_s, remaining_str = self.is_locked_out()
+            if is_locked:
+                console.print(f"[bold red]⏳ Account on Binance Lockout! Cannot claim Square post. Time remaining: {remaining_str}. (Skipping)[/bold red]")
+                return {
+                    "url": post_url,
+                    "answer": answer,
+                    "status": "rate_limited",
+                    "message": f"Binance lockout active: {remaining_str} remaining",
+                    "retry_after": remaining_s
+                }
+
             if not self.page:
                 await self.initialize()
 
@@ -618,6 +957,7 @@ class BinanceRedeemer:
                                 console.print(f"[bold gold1]🎉 [SUCCESS] Red Packet Opened for post {post_url}![/bold gold1]")
                                 result["status"] = "success"
                                 result["message"] = "Red Packet opened"
+                                self._reset_circuit_breaker()
                                 await self._dismiss_modals()
                                 await self._human_delay(1.8, 3.5)
                                 return result
@@ -651,6 +991,16 @@ class BinanceRedeemer:
     async def claim_red_packet_url(self, url: str, max_attempts: int = 3) -> Dict[str, Any]:
         """Navigates to direct s.binance.com red packet links and auto-clicks Open. Single-threaded via asyncio.Lock."""
         async with self._lock:
+            is_locked, remaining_s, remaining_str = self.is_locked_out()
+            if is_locked:
+                console.print(f"[bold red]⏳ Account on Binance Lockout! Cannot open link. Time remaining: {remaining_str}. (Skipping)[/bold red]")
+                return {
+                    "url": url,
+                    "status": "rate_limited",
+                    "message": f"Binance lockout active: {remaining_str} remaining",
+                    "retry_after": remaining_s
+                }
+
             if not self.page:
                 await self.initialize()
 
@@ -680,6 +1030,7 @@ class BinanceRedeemer:
                             await open_btn.click(timeout=2000, force=True)
                             console.print(f"[bold gold1]🎉 [SUCCESS] Clicked Open on Red Packet link![/bold gold1]")
                             result["status"] = "success"
+                            self._reset_circuit_breaker()
                             await self._dismiss_modals()
                         else:
                             result["status"] = "opened"

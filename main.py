@@ -2,6 +2,7 @@ import os
 import sys
 import json
 import asyncio
+from datetime import datetime, timezone
 from typing import Set, Dict, Any, List
 from dotenv import load_dotenv
 from telethon import TelegramClient, events
@@ -36,6 +37,8 @@ if not API_ID or not API_HASH or not TARGET_CHANNELS:
     exit(1)
 
 CACHE_FILE = os.path.abspath("./claimed_cache.json")
+MAX_FRESH_CODE_AGE_SECONDS = 180  # Codes older than 3 minutes are dead in public channels
+
 
 def load_claimed_cache() -> Set[str]:
     if os.path.exists(CACHE_FILE):
@@ -47,12 +50,14 @@ def load_claimed_cache() -> Set[str]:
             return set()
     return set()
 
+
 def save_claimed_cache(cache: Set[str]):
     try:
         with open(CACHE_FILE, "w", encoding="utf-8") as f:
             json.dump(list(cache), f, indent=2)
     except Exception as e:
         console.print(f"[dim yellow][!] Warning: Could not save cache: {e}[/dim yellow]")
+
 
 def format_phone_number(phone_input: str) -> str:
     phone_input = phone_input.strip().replace(" ", "").replace("-", "")
@@ -67,70 +72,101 @@ def format_phone_number(phone_input: str) -> str:
             return f"+{phone_input}"
     return phone_input
 
+
 def phone_callback():
     if PHONE:
         return format_phone_number(PHONE)
     raw_phone = console.input("[bold cyan]Enter your Telegram phone number (with country code, e.g. +1234567890): [/bold cyan]")
     return format_phone_number(raw_phone)
 
+
 client = TelegramClient('binance_session', int(API_ID), API_HASH)
 redeemer = BinanceRedeemer(headless=HEADLESS_MODE)
 claimed_items: Set[str] = load_claimed_cache()
 
+
 async def process_single_item(item_type: str, identifier: str, extra: str = ""):
     if identifier in claimed_items:
-        console.print(f"[dim]↷ Skipping already processed {item_type}: {identifier}[/dim]")
+        console.print(f"[dim]↷ Skipping already cached {item_type}: {identifier}[/dim]")
+        return
+
+    # Check if account is on active Binance cooldown
+    is_locked, remaining_s, remaining_str = redeemer.is_locked_out()
+    if is_locked:
+        console.print(f"[bold red]⏳ Account on Binance Lockout! Cannot claim '{identifier}'. Time remaining: {remaining_str}. (Skipped)[/bold red]")
         return
 
     if item_type == "code":
         console.print(f"[bold gold1]⚡ Claiming Crypto Box Code: [bold white]{identifier}[/bold white][/bold gold1]")
         res = await redeemer.claim_crypto_box_code(identifier)
         status = res.get("status", "")
-        if status in ["success", "expired", "already_claimed", "invalid", "done"]:
+
+        if status in ["success", "expired", "already_claimed", "invalid"]:
             claimed_items.add(identifier)
             save_claimed_cache(claimed_items)
+        elif status == "rate_limited":
+            rem_str = redeemer.get_lockout_remaining_str()
+            console.print(Panel(
+                f"[bold red]🚫 BINANCE RATE LIMIT / LOCKOUT ACTIVATED[/bold red]\n"
+                f"[bold white]Code '[bold yellow]{identifier}[/bold yellow]' was not claimed and will NOT be cached.[/bold white]\n"
+                f"[bold yellow]Bot is pausing claims for {rem_str} to protect your account.[/bold yellow]",
+                title="[bold red]Rate Limit Alert[/bold red]",
+                border_style="red"
+            ))
         else:
-            console.print(f"[bold yellow][!] Code '{identifier}' was not cached ({status}: {res.get('message')}). It will be retried automatically.[/bold yellow]")
+            console.print(f"[bold yellow][!] Code '{identifier}' returned status '{status}' ({res.get('message')}). Not cached.[/bold yellow]")
 
     elif item_type == "square":
         console.print(f"[bold gold1]⚡ Claiming Binance Square Post: [bold white]{identifier}[/bold white] (Answer: [bold yellow]{extra}[/bold yellow])[/bold gold1]")
         res = await redeemer.claim_binance_square_red_packet(identifier, extra)
         status = res.get("status", "")
-        if status in ["success", "submitted", "opened", "expired", "already_claimed", "invalid", "done"]:
+
+        if status in ["success", "submitted", "opened", "expired", "already_claimed", "invalid"]:
             claimed_items.add(identifier)
             save_claimed_cache(claimed_items)
+        elif status == "rate_limited":
+            rem_str = redeemer.get_lockout_remaining_str()
+            console.print(f"[bold red]🚫 Lockout active ({rem_str} remaining). Square post '{identifier}' held.[/bold red]")
         else:
-            console.print(f"[bold yellow][!] Square post '{identifier}' was not cached ({status}: {res.get('message')}). It can be retried.[/bold yellow]")
+            console.print(f"[bold yellow][!] Square post '{identifier}' returned '{status}'. Not cached.[/bold yellow]")
 
     elif item_type == "url":
         console.print(f"[bold gold1]⚡ Opening Red Packet Link: [bold white]{identifier}[/bold white][/bold gold1]")
         res = await redeemer.claim_red_packet_url(identifier)
         status = res.get("status", "")
-        if status in ["success", "opened", "expired", "already_claimed", "invalid", "done"]:
+
+        if status in ["success", "opened", "expired", "already_claimed", "invalid"]:
             claimed_items.add(identifier)
             save_claimed_cache(claimed_items)
+        elif status == "rate_limited":
+            rem_str = redeemer.get_lockout_remaining_str()
+            console.print(f"[bold red]🚫 Lockout active ({rem_str} remaining). Link '{identifier}' held.[/bold red]")
         else:
-            console.print(f"[bold yellow][!] Link '{identifier}' was not cached ({status}: {res.get('message')}).[/bold yellow]")
+            console.print(f"[bold yellow][!] Link '{identifier}' returned '{status}'. Not cached.[/bold yellow]")
+
 
 def determine_sweep_limits(channel_name: str) -> tuple[int, int]:
     ch_lower = channel_name.lower()
     if "cryptobox" in ch_lower or "parser" in ch_lower:
-        return 15, 0
+        return 20, 0
     elif "freereward" in ch_lower:
-        return 10, 5
+        return 15, 5
     else:
-        return 10, 5
+        return 15, 5
+
 
 async def scan_and_claim_history(channel_entities: List[Any]):
     console.print(Panel(
-        "[bold cyan]🔍 Starting Per-Channel Historical Sweep...[/bold cyan]\n"
-        "[bold white]• Cryptobox Parser:[/bold white] Recent 15 codes\n"
-        "[bold white]• Freerewardes:[/bold white] Recent 10 codes & 5 questions",
+        "[bold cyan]🔍 Starting Intelligent Channel History Sweep...[/bold cyan]\n"
+        f"[bold white]• Freshness Policy:[/bold white] Only drops < {MAX_FRESH_CODE_AGE_SECONDS // 60} minutes old are claimed.\n"
+        "[bold white]• Anti-Ban Protection:[/bold white] Stale historical codes are auto-cached (skipped) to prevent Binance bruteforce lockouts.",
         title="[bold yellow]Targeted Catch-Up Mode[/bold yellow]"
     ))
 
-    all_recent_codes: List[str] = []
-    all_recent_questions: List[Dict[str, str]] = []
+    now = datetime.now(timezone.utc)
+    fresh_codes: List[str] = []
+    fresh_questions: List[Dict[str, str]] = []
+    stale_codes_indexed = 0
 
     for entity in channel_entities:
         chat_name = str(entity)
@@ -141,44 +177,49 @@ async def scan_and_claim_history(channel_entities: List[Any]):
             pass
 
         code_limit, question_limit = determine_sweep_limits(chat_name)
-        console.print(f"[cyan][+] Scanning recent history from '[bold white]{chat_name}[/bold white]' (Target: {code_limit} codes, {question_limit} questions)...[/cyan]")
-
-        ch_codes: List[str] = []
-        ch_questions: List[Dict[str, str]] = []
+        console.print(f"[cyan][+] Scanning recent messages from '[bold white]{chat_name}[/bold white]'...[/cyan]")
 
         try:
-            async for msg in client.iter_messages(entity, limit=200):
-                if not msg.raw_text:
+            async for msg in client.iter_messages(entity, limit=100):
+                if not msg.raw_text or not msg.date:
                     continue
+
+                msg_age_seconds = (now - msg.date).total_seconds()
+                is_fresh = msg_age_seconds <= MAX_FRESH_CODE_AGE_SECONDS
+
                 parsed = parse_telegram_message(msg.raw_text)
 
                 for c in parsed.get("codes", []):
-                    if c not in ch_codes and len(ch_codes) < code_limit:
-                        ch_codes.append(c)
+                    if is_fresh:
+                        if c not in fresh_codes and c not in claimed_items and len(fresh_codes) < code_limit:
+                            fresh_codes.append(c)
+                    else:
+                        if c not in claimed_items:
+                            claimed_items.add(c)
+                            stale_codes_indexed += 1
 
                 sq_urls = parsed.get("square_urls", [])
                 answers = parsed.get("answers", [])
                 if sq_urls and answers and question_limit > 0:
                     url = sq_urls[0]
                     ans = answers[0]
-                    if not any(q["url"] == url for q in ch_questions) and len(ch_questions) < question_limit:
-                        ch_questions.append({"url": url, "answer": ans})
+                    if is_fresh:
+                        if not any(q["url"] == url for q in fresh_questions) and url not in claimed_items and len(fresh_questions) < question_limit:
+                            fresh_questions.append({"url": url, "answer": ans})
+                    else:
+                        if url not in claimed_items:
+                            claimed_items.add(url)
+                            stale_codes_indexed += 1
 
-                if len(ch_codes) >= code_limit and (question_limit == 0 or len(ch_questions) >= question_limit):
-                    break
         except Exception as e:
             console.print(f"[yellow][!] Notice while scanning history from {chat_name}: {e}[/yellow]")
 
-        for c in ch_codes:
-            if c not in all_recent_codes:
-                all_recent_codes.append(c)
+    # Persist the newly pre-cached stale items to protect the session
+    if stale_codes_indexed > 0:
+        save_claimed_cache(claimed_items)
+        console.print(f"[dim green][✓] Pre-cached {stale_codes_indexed} expired historical drops to prevent dead-code attempts.[/dim green]")
 
-        for q in ch_questions:
-            if not any(item["url"] == q["url"] for item in all_recent_questions):
-                all_recent_questions.append(q)
-
-    uncached_codes = [c for c in all_recent_codes if c not in claimed_items]
-    history_table = Table(title=f"📋 Sweep Summary ({len(all_recent_codes)} Total Codes Found, {len(uncached_codes)} New To Claim)", show_header=True, header_style="bold magenta")
+    history_table = Table(title=f"📋 History Sweep Summary ({len(fresh_codes)} Fresh Codes, {len(fresh_questions)} Fresh Questions)", show_header=True, header_style="bold magenta")
     history_table.add_column("#", style="dim", width=4)
     history_table.add_column("Type", style="cyan", width=12)
     history_table.add_column("Item / Code / URL", style="bold white")
@@ -186,29 +227,32 @@ async def scan_and_claim_history(channel_entities: List[Any]):
     history_table.add_column("Status", style="bold")
 
     idx = 1
-    for c in all_recent_codes:
-        status = "[dim]Cached (Skipped)[/dim]" if c in claimed_items else "[bold green]Ready To Claim[/bold green]"
-        history_table.add_row(str(idx), "Crypto Box", c, "-", status)
+    for c in fresh_codes:
+        history_table.add_row(str(idx), "Crypto Box", c, "< 3 mins old", "[bold green]Ready To Claim[/bold green]")
         idx += 1
 
-    for q in all_recent_questions:
-        status = "[dim]Cached (Skipped)[/dim]" if q["url"] in claimed_items else "[bold green]Ready To Claim[/bold green]"
-        history_table.add_row(str(idx), "Square Post", q["url"], q["answer"], status)
+    for q in fresh_questions:
+        history_table.add_row(str(idx), "Square Post", q["url"], q["answer"], "[bold green]Ready To Claim[/bold green]")
         idx += 1
+
+    if idx == 1:
+        history_table.add_row("-", "All Clear", "No unhandled fresh drops in channel history", "-", "[dim]Up to date[/dim]")
 
     console.print(history_table)
 
-    if all_recent_codes:
-        console.print(f"\n[bold cyan]▶ Attempting to claim {len(all_recent_codes)} historical codes...[/bold cyan]")
-        for c in all_recent_codes:
+    # Process only verified fresh items
+    if fresh_codes:
+        console.print(f"\n[bold cyan]▶ Attempting to claim {len(fresh_codes)} fresh historical codes...[/bold cyan]")
+        for c in fresh_codes:
             await process_single_item("code", c)
 
-    if all_recent_questions:
-        console.print(f"\n[bold cyan]▶ Attempting to claim {len(all_recent_questions)} historical questions...[/bold cyan]")
-        for q in all_recent_questions:
+    if fresh_questions:
+        console.print(f"\n[bold cyan]▶ Attempting to claim {len(fresh_questions)} fresh historical questions...[/bold cyan]")
+        for q in fresh_questions:
             await process_single_item("square", q["url"], q["answer"])
 
-    console.print("\n[bold green][✓] Targeted historical sweep completed![/bold green]\n")
+    console.print("\n[bold green][✓] History scan completed smoothly![/bold green]\n")
+
 
 @client.on(events.NewMessage(chats=TARGET_CHANNELS))
 async def live_message_handler(event):
@@ -220,7 +264,19 @@ async def live_message_handler(event):
 
     message_text = event.raw_text
     console.print(Panel(message_text, title=f"[bold green]📩 New Drop from {chat_name}[/bold green]", border_style="green"))
-    
+
+    # Freshness verification
+    if event.message and event.message.date:
+        now = datetime.now(timezone.utc)
+        age = (now - event.message.date).total_seconds()
+        if age > MAX_FRESH_CODE_AGE_SECONDS:
+            console.print(f"[dim yellow]↷ Skipping stale live drop ({int(age)}s old) to protect account against dead-code bans.[/dim yellow]\n")
+            parsed = parse_telegram_message(message_text)
+            for c in parsed.get("codes", []):
+                claimed_items.add(c)
+            save_claimed_cache(claimed_items)
+            return
+
     parsed = parse_telegram_message(message_text)
     codes = parsed.get("codes", [])
     square_urls = parsed.get("square_urls", [])
@@ -229,6 +285,12 @@ async def live_message_handler(event):
 
     if not codes and not square_urls and not red_packet_urls:
         console.print("[dim][i] Post received, but no red packet codes or reward links found.[/dim]\n")
+        return
+
+    # Check lockout before dispatching
+    is_locked, remaining_s, remaining_str = redeemer.is_locked_out()
+    if is_locked:
+        console.print(f"[bold red]⏳ Account currently in Binance lockout ({remaining_str} remaining). Holding live drops.[/bold red]\n")
         return
 
     for sq_url in square_urls:
@@ -241,7 +303,11 @@ async def live_message_handler(event):
     for rp_url in red_packet_urls:
         await process_single_item("url", rp_url)
 
+
 async def main():
+    is_locked, remaining_s, remaining_str = redeemer.is_locked_out()
+    lockout_status = f"[bold red]Active ({remaining_str} remaining)[/bold red]" if is_locked else "[bold green]Clear (Ready to Claim)[/bold green]"
+
     table = Table(title="🚀 Binance Red Packet & Feed Auto-Claimer", show_header=True, header_style="bold magenta")
     table.add_column("Setting", style="dim", width=25)
     table.add_column("Value", style="bold green")
@@ -250,7 +316,17 @@ async def main():
     table.add_row("Redemption URL", "https://www.binance.com/en/my/wallet/account/payment/cryptobox")
     table.add_row("Session Directory", "./user_data")
     table.add_row("Cached Items", str(len(claimed_items)))
+    table.add_row("Lockout Status", lockout_status)
     console.print(table)
+
+    if is_locked:
+        console.print(Panel(
+            f"[bold red]⚠️ ACTIVE BINANCE RATE LIMIT DETECTED[/bold red]\n"
+            f"[bold white]Your Binance account is on cooldown ({remaining_str} remaining).[/bold white]\n"
+            f"[bold yellow]The bot is running in stealth listener mode. Claims will automatically resume once the lockout expires.[/bold yellow]",
+            title="[bold yellow]Protection Mode Active[/bold yellow]",
+            border_style="yellow"
+        ))
 
     await redeemer.initialize()
     await redeemer.check_login_status()
@@ -272,6 +348,7 @@ async def main():
 
     console.print(f"[bold gold1]📡 Bot is actively listening for live drops on: {', '.join(TARGET_CHANNELS)}... (Press Ctrl+C to stop)[/bold gold1]\n")
     await client.run_until_disconnected()
+
 
 if __name__ == "__main__":
     try:
