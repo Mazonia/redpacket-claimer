@@ -3,6 +3,7 @@ import sys
 import json
 import time
 import asyncio
+import argparse
 from datetime import datetime, timezone
 from typing import Set, Dict, Any, List, Optional
 from dotenv import load_dotenv
@@ -20,9 +21,27 @@ if sys.platform == "win32":
     except Exception:
         pass
 
+
+if sys.platform == "win32":
+    try:
+        import ctypes
+        ctypes.windll.kernel32.SetConsoleTitleW("RedPacket-Auto-Claimer")
+    except Exception:
+        pass
+
 load_dotenv()
 
 console = Console()
+
+def parse_cli_args():
+    parser = argparse.ArgumentParser(description="Binance Red Packet & Feed Auto-Claimer")
+    parser.add_argument("--catchup", type=int, default=35, help="Number of recent channel drops to sweep and claim on startup (default: 35)")
+    parser.add_argument("--clear-lockout", action="store_true", help="Clear saved Binance lockout state immediately")
+    parser.add_argument("--clear-cache", action="store_true", help="Clear claimed codes cache")
+    parser.add_argument("--headless", action="store_true", help="Force headless browser mode")
+    parser.add_argument("--headful", action="store_true", help="Force visible browser mode")
+    args, _ = parser.parse_known_args()
+    return args
 
 API_ID = os.getenv("TELEGRAM_API_ID")
 API_HASH = os.getenv("TELEGRAM_API_HASH")
@@ -179,6 +198,7 @@ async def process_single_item(item_type: str, identifier: str, extra: str = "", 
         if status in ["success", "expired", "already_claimed", "invalid"]:
             claimed_items.add(identifier)
             save_claimed_cache(claimed_items)
+            redeemer.clear_lockout()
         elif status == "rate_limited":
             rem_str = redeemer.get_lockout_remaining_str()
             console.print(Panel(
@@ -200,6 +220,7 @@ async def process_single_item(item_type: str, identifier: str, extra: str = "", 
         if status in ["success", "submitted", "opened", "expired", "already_claimed", "invalid"]:
             claimed_items.add(identifier)
             save_claimed_cache(claimed_items)
+            redeemer.clear_lockout()
         elif status == "rate_limited":
             rem_str = redeemer.get_lockout_remaining_str()
             console.print(f"[bold red]🚫 Lockout active ({rem_str} remaining). Square post '{identifier}' held in queue.[/bold red]")
@@ -215,6 +236,7 @@ async def process_single_item(item_type: str, identifier: str, extra: str = "", 
         if status in ["success", "opened", "expired", "already_claimed", "invalid"]:
             claimed_items.add(identifier)
             save_claimed_cache(claimed_items)
+            redeemer.clear_lockout()
         elif status == "rate_limited":
             rem_str = redeemer.get_lockout_remaining_str()
             console.print(f"[bold red]🚫 Lockout active ({rem_str} remaining). Link '{identifier}' held in queue.[/bold red]")
@@ -223,28 +245,17 @@ async def process_single_item(item_type: str, identifier: str, extra: str = "", 
             console.print(f"[bold yellow][!] Link '{identifier}' returned '{status}'. Not cached.[/bold yellow]")
 
 
-def determine_sweep_limits(channel_name: str) -> tuple[int, int]:
-    ch_lower = channel_name.lower()
-    if "cryptobox" in ch_lower or "parser" in ch_lower:
-        return 20, 0
-    elif "freereward" in ch_lower:
-        return 15, 5
-    else:
-        return 15, 5
-
-
-async def scan_and_claim_history(channel_entities: List[Any]):
+async def scan_and_claim_history(channel_entities: List[Any], catchup_limit: int = 35):
     console.print(Panel(
         "[bold cyan]🔍 Starting Intelligent Channel History Sweep...[/bold cyan]\n"
-        f"[bold white]• Freshness Policy:[/bold white] Only drops < {MAX_FRESH_CODE_AGE_SECONDS // 60} minutes old are claimed.\n"
-        "[bold white]• Anti-Ban Protection:[/bold white] Stale historical codes are auto-cached (skipped) to prevent Binance bruteforce lockouts.",
-        title="[bold yellow]Targeted Catch-Up Mode[/bold yellow]"
+        f"[bold white]• Catch-Up Target:[/bold white] Up to {catchup_limit} recent drops from channel history.\n"
+        "[bold white]• Circuit Breaker:[/bold white] Safe pauses between dead drops to protect account from Binance lockouts.",
+        title="[bold yellow]Catch-Up & History Sweep Mode[/bold yellow]"
     ))
 
     now = datetime.now(timezone.utc)
-    fresh_codes: List[str] = []
-    fresh_questions: List[Dict[str, str]] = []
-    stale_codes_indexed = 0
+    pending_items: List[Dict[str, Any]] = []
+    ancient_codes_indexed = 0
 
     for entity in channel_entities:
         chat_name = str(entity)
@@ -254,82 +265,94 @@ async def scan_and_claim_history(channel_entities: List[Any]):
         except Exception:
             pass
 
-        code_limit, question_limit = determine_sweep_limits(chat_name)
         console.print(f"[cyan][+] Scanning recent messages from '[bold white]{chat_name}[/bold white]'...[/cyan]")
 
         try:
-            async for msg in client.iter_messages(entity, limit=100):
+            channel_items = []
+            async for msg in client.iter_messages(entity, limit=80):
                 if not msg.raw_text or not msg.date:
                     continue
 
                 msg_age_seconds = (now - msg.date).total_seconds()
-                is_fresh = msg_age_seconds <= MAX_FRESH_CODE_AGE_SECONDS
-
                 parsed = parse_telegram_message(msg.raw_text)
 
                 for c in parsed.get("codes", []):
-                    if is_fresh:
-                        if c not in fresh_codes and c not in claimed_items and len(fresh_codes) < code_limit:
-                            fresh_codes.append(c)
+                    if c in claimed_items:
+                        continue
+                    if msg_age_seconds > 86400:  # Older than 24 hours
+                        claimed_items.add(c)
+                        ancient_codes_indexed += 1
                     else:
-                        if c not in claimed_items:
-                            claimed_items.add(c)
-                            stale_codes_indexed += 1
+                        channel_items.append({
+                            "type": "code",
+                            "identifier": c,
+                            "extra": "",
+                            "date": msg.date,
+                            "age_s": int(msg_age_seconds),
+                            "channel": chat_name
+                        })
 
                 sq_urls = parsed.get("square_urls", [])
                 answers = parsed.get("answers", [])
-                if sq_urls and answers and question_limit > 0:
+                if sq_urls and answers:
                     url = sq_urls[0]
                     ans = answers[0]
-                    if is_fresh:
-                        if not any(q["url"] == url for q in fresh_questions) and url not in claimed_items and len(fresh_questions) < question_limit:
-                            fresh_questions.append({"url": url, "answer": ans})
-                    else:
-                        if url not in claimed_items:
+                    if url not in claimed_items:
+                        if msg_age_seconds > 86400:
                             claimed_items.add(url)
-                            stale_codes_indexed += 1
+                            ancient_codes_indexed += 1
+                        else:
+                            channel_items.append({
+                                "type": "square",
+                                "identifier": url,
+                                "extra": ans,
+                                "date": msg.date,
+                                "age_s": int(msg_age_seconds),
+                                "channel": chat_name
+                            })
+
+            # Sort channel drops chronologically (oldest in the recent window first)
+            channel_items.sort(key=lambda x: x["date"])
+            # Take up to catchup_limit for this channel
+            pending_items.extend(channel_items[-catchup_limit:] if len(channel_items) > catchup_limit else channel_items)
 
         except Exception as e:
             console.print(f"[yellow][!] Notice while scanning history from {chat_name}: {e}[/yellow]")
 
-    # Persist the newly pre-cached stale items to protect the session
-    if stale_codes_indexed > 0:
+    if ancient_codes_indexed > 0:
         save_claimed_cache(claimed_items)
-        console.print(f"[dim green][✓] Pre-cached {stale_codes_indexed} expired historical drops to prevent dead-code attempts.[/dim green]")
+        console.print(f"[dim green][✓] Pre-cached {ancient_codes_indexed} ancient (>24h) drops.[/dim green]")
 
-    history_table = Table(title=f"📋 History Sweep Summary ({len(fresh_codes)} Fresh Codes, {len(fresh_questions)} Fresh Questions)", show_header=True, header_style="bold magenta")
+    history_table = Table(title=f"📋 History Sweep Summary ({len(pending_items)} Recent Drops Found)", show_header=True, header_style="bold magenta")
     history_table.add_column("#", style="dim", width=4)
     history_table.add_column("Type", style="cyan", width=12)
     history_table.add_column("Item / Code / URL", style="bold white")
-    history_table.add_column("Detail", style="bold yellow")
+    history_table.add_column("Age", style="bold yellow")
     history_table.add_column("Status", style="bold")
 
     idx = 1
-    for c in fresh_codes:
-        history_table.add_row(str(idx), "Crypto Box", c, "< 3 mins old", "[bold green]Ready To Claim[/bold green]")
+    for item in pending_items:
+        age_str = f"{item['age_s'] // 60}m ago" if item['age_s'] >= 60 else f"{item['age_s']}s ago"
+        history_table.add_row(str(idx), item["type"].capitalize(), item["identifier"], age_str, "[bold green]Ready To Claim[/bold green]")
         idx += 1
 
-    for q in fresh_questions:
-        history_table.add_row(str(idx), "Square Post", q["url"], q["answer"], "[bold green]Ready To Claim[/bold green]")
-        idx += 1
-
-    if idx == 1:
-        history_table.add_row("-", "All Clear", "No unhandled fresh drops in channel history", "-", "[dim]Up to date[/dim]")
+    if not pending_items:
+        history_table.add_row("-", "All Clear", "No unhandled recent drops in channel history", "-", "[dim]Up to date[/dim]")
 
     console.print(history_table)
 
-    # Process only verified fresh items
-    if fresh_codes:
-        console.print(f"\n[bold cyan]▶ Attempting to claim {len(fresh_codes)} fresh historical codes...[/bold cyan]")
-        for c in fresh_codes:
-            await process_single_item("code", c)
+    # Process catch-up items
+    if pending_items:
+        console.print(f"\n[bold cyan]▶ Attempting to redeem {len(pending_items)} missed / recent drops...[/bold cyan]")
+        for item in pending_items:
+            is_locked, _, _ = redeemer.is_locked_out()
+            if is_locked:
+                console.print("[bold red]⏳ Cooldown encountered during catch-up sweep. Remaining items placed in held queue.[/bold red]")
+                enqueue_held_drop(item["type"], item["identifier"], item["extra"], timestamp=item["date"].timestamp())
+                continue
+            await process_single_item(item["type"], item["identifier"], item["extra"], timestamp=item["date"].timestamp())
 
-    if fresh_questions:
-        console.print(f"\n[bold cyan]▶ Attempting to claim {len(fresh_questions)} fresh historical questions...[/bold cyan]")
-        for q in fresh_questions:
-            await process_single_item("square", q["url"], q["answer"])
-
-    console.print("\n[bold green][✓] History scan completed smoothly![/bold green]\n")
+    console.print("\n[bold green][✓] Channel history sweep completed smoothly![/bold green]\n")
 
 
 @client.on(events.NewMessage(chats=TARGET_CHANNELS))
@@ -344,18 +367,8 @@ async def live_message_handler(event):
     console.print(Panel(message_text, title=f"[bold green]📩 New Drop from {chat_name}[/bold green]", border_style="green"))
 
     msg_timestamp = time.time()
-    # Freshness verification
     if event.message and event.message.date:
         msg_timestamp = event.message.date.timestamp()
-        now = datetime.now(timezone.utc)
-        age = (now - event.message.date).total_seconds()
-        if age > MAX_FRESH_CODE_AGE_SECONDS:
-            console.print(f"[dim yellow]↷ Skipping stale live drop ({int(age)}s old) to protect account against dead-code bans.[/dim yellow]\n")
-            parsed = parse_telegram_message(message_text)
-            for c in parsed.get("codes", []):
-                claimed_items.add(c)
-            save_claimed_cache(claimed_items)
-            return
 
     parsed = parse_telegram_message(message_text)
     codes = parsed.get("codes", [])
@@ -402,7 +415,7 @@ async def keepalive_watchdog():
             pass
 
 
-async def connect_and_listen():
+async def connect_and_listen(catchup_limit: int = 35):
     """
     Manages Telegram client connection and live listening with stepped exponential backoff:
     30s -> 1m -> 3m -> 5m -> 10m -> 20m -> 30m -> 45m
@@ -449,7 +462,7 @@ async def connect_and_listen():
                     resolved_entities.append(ch)
 
             # Catch-up history sweep for fresh drops received during downtime/start
-            await scan_and_claim_history(resolved_entities)
+            await scan_and_claim_history(resolved_entities, catchup_limit=catchup_limit)
 
             console.print(f"[bold gold1]📡 Bot is actively listening for live drops on: {', '.join(TARGET_CHANNELS)}... (Press Ctrl+C to stop)[/bold gold1]\n")
 
@@ -543,8 +556,8 @@ async def lockout_queue_monitor():
                     continue
 
                 age = now_ts - ts
-                if age > MAX_FRESH_CODE_AGE_SECONDS:
-                    console.print(f"[dim yellow]↷ Skipping held {item_type} '{identifier}' ({int(age)}s old) — expired during lockout to protect account.[/dim yellow]")
+                if age > 86400:  # Older than 24 hours
+                    console.print(f"[dim yellow]↷ Skipping held {item_type} '{identifier}' ({int(age)}s old) — ancient drop to protect account.[/dim yellow]")
                     claimed_items.add(identifier)
                     save_claimed_cache(claimed_items)
                     continue
@@ -566,6 +579,25 @@ async def lockout_queue_monitor():
 
 
 async def main():
+    cli_args = parse_cli_args()
+
+    global HEADLESS_MODE
+    if cli_args.headless:
+        HEADLESS_MODE = True
+        redeemer.headless = True
+    elif cli_args.headful:
+        HEADLESS_MODE = False
+        redeemer.headless = False
+
+    if cli_args.clear_lockout:
+        redeemer.clear_lockout()
+        console.print("[bold green][✓] Manually cleared Binance lockout state on startup.[/bold green]")
+
+    if cli_args.clear_cache:
+        claimed_items.clear()
+        save_claimed_cache(claimed_items)
+        console.print("[bold green][✓] Cleared claimed codes cache.[/bold green]")
+
     is_locked, remaining_s, remaining_str = redeemer.is_locked_out()
     lockout_status = f"[bold red]Active ({remaining_str} remaining)[/bold red]" if is_locked else "[bold green]Clear (Ready to Claim)[/bold green]"
 
@@ -579,6 +611,7 @@ async def main():
     table.add_row("Cached Items", str(len(claimed_items)))
     table.add_row("Queued Held Drops", f"{len(held_drops)} item(s)")
     table.add_row("Lockout Status", lockout_status)
+    table.add_row("Catch-Up Sweep Limit", f"{cli_args.catchup} recent drops")
     table.add_row("Auto-Reconnect Ladder", "30s → 1m → 3m → 5m → 10m → 20m → 30m → 45m")
     console.print(table)
 
@@ -586,7 +619,8 @@ async def main():
         console.print(Panel(
             f"[bold red]⚠️ ACTIVE BINANCE RATE LIMIT DETECTED[/bold red]\n"
             f"[bold white]Your Binance account is on cooldown ({remaining_str} remaining).[/bold white]\n"
-            f"[bold yellow]The bot is running in stealth listener mode. Drops will be queued and auto-redeemed once lockout expires.[/bold yellow]",
+            f"[bold yellow]The bot is running in stealth listener mode. Drops will be queued and auto-redeemed once lockout expires.[/bold yellow]\n"
+            f"[dim cyan]Tip: If you tested a code manually and it worked, pass --clear-lockout flag to reset this timer.[/dim cyan]",
             title="[bold yellow]Protection Mode Active[/bold yellow]",
             border_style="yellow"
         ))
@@ -596,7 +630,7 @@ async def main():
     try:
         await redeemer.initialize()
         await redeemer.check_login_status()
-        await connect_and_listen()
+        await connect_and_listen(catchup_limit=cli_args.catchup)
     finally:
         lockout_task.cancel()
         try:

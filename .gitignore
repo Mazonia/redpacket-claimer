@@ -32,3 +32,6 @@ scratch/
 # Operating System files
 .DS_Store
 Thumbs.db
+
+*.exe
+held_drops.json

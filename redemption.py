@@ -1,4 +1,5 @@
 import os
+import sys
 import re
 import json
 import time
@@ -7,6 +8,13 @@ import random
 from typing import Optional, List, Dict, Any, Tuple
 from playwright.async_api import async_playwright, BrowserContext, Page
 from rich.console import Console
+
+if sys.platform == "win32":
+    try:
+        sys.stdout.reconfigure(encoding="utf-8")
+        sys.stderr.reconfigure(encoding="utf-8")
+    except Exception:
+        pass
 
 console = Console()
 USER_DATA_DIR = os.path.abspath("./user_data")
@@ -37,8 +45,8 @@ def parse_lockout_duration(text: str) -> int:
         seconds = int(s_match.group(1))
 
     total = hours * 3600 + minutes * 60 + seconds
-    # Default to 4 hours (14400s) if a lockout is triggered without explicit numbers
-    return total if total > 0 else 14400
+    # Default to 5 minutes (300s) if a lockout is triggered without explicit numbers (avoiding excessive 4hr bans)
+    return total if total > 0 else 300
 
 
 def format_duration(seconds: int) -> str:
@@ -270,37 +278,91 @@ class BinanceRedeemer:
             await self.page.keyboard.press("Escape")
             await asyncio.sleep(0.2)
 
-            # 3. If modal or mask is still present in DOM, forcefully remove it so it cannot block clicks
+            # 3. If modal, mask, or toast is still present in DOM, forcefully remove it so it cannot block clicks or pollute feedback
             await self.page.evaluate("""() => {
-                const lingering = document.querySelectorAll('.bn-mask, .bn-modal, .openbox, [role="presentation"].bn-mask');
+                const lingering = document.querySelectorAll('.bn-mask, .bn-modal, .openbox, [role="presentation"].bn-mask, .toast, .bn-toast, .bn-feedback');
                 lingering.forEach(el => el.remove());
             }""")
             await asyncio.sleep(0.2)
         except Exception:
             pass
 
+    def _cleanup_stale_locks(self):
+        """Removes orphaned lock files and terminates lingering Chromium processes using USER_DATA_DIR."""
+        for lock_name in ["lockfile", "SingletonLock", "SingletonCookie", "SingletonSocket"]:
+            lock_path = os.path.join(USER_DATA_DIR, lock_name)
+            if os.path.exists(lock_path):
+                try:
+                    os.remove(lock_path)
+                except Exception:
+                    pass
+
+        if sys.platform == "win32":
+            try:
+                import subprocess
+                ps_script = """
+                Get-CimInstance Win32_Process | Where-Object { $_.Name -match 'chrome' -or $_.Name -match 'msedge' } | ForEach-Object {
+                    if ($_.CommandLine -and ($_.CommandLine -match 'user_data' -or $_.CommandLine -match 'ms-playwright')) {
+                        Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue
+                    }
+                }
+                """
+                subprocess.run(["powershell", "-NoProfile", "-Command", ps_script], capture_output=True, timeout=5)
+                for lock_name in ["lockfile", "SingletonLock", "SingletonCookie", "SingletonSocket"]:
+                    lock_path = os.path.join(USER_DATA_DIR, lock_name)
+                    if os.path.exists(lock_path):
+                        try:
+                            os.remove(lock_path)
+                        except Exception:
+                            pass
+            except Exception:
+                pass
+
     async def initialize(self):
         """Starts Playwright with persistent context so login session and cookies persist."""
         if self.context:
             return
 
+        self._cleanup_stale_locks()
         self._pw = await async_playwright().start()
         console.print(f"[bold cyan][+] Launching Playwright browser (Headless: {self.headless})...[/bold cyan]")
         os.makedirs(USER_DATA_DIR, exist_ok=True)
         
-        self.context = await self._pw.chromium.launch_persistent_context(
-            user_data_dir=USER_DATA_DIR,
-            headless=self.headless,
-            viewport={"width": 1280, "height": 850},
-            user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
-            args=[
-                "--disable-blink-features=AutomationControlled",
-                "--no-sandbox",
-                "--disable-setuid-sandbox",
-                "--disable-infobars",
-                "--window-size=1280,850"
-            ]
-        )
+        try:
+            self.context = await self._pw.chromium.launch_persistent_context(
+                user_data_dir=USER_DATA_DIR,
+                headless=self.headless,
+                viewport={"width": 1280, "height": 850},
+                user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+                args=[
+                    "--disable-blink-features=AutomationControlled",
+                    "--no-sandbox",
+                    "--disable-setuid-sandbox",
+                    "--disable-infobars",
+                    "--window-size=1280,850"
+                ]
+            )
+        except Exception as e:
+            if "existing browser session" in str(e).lower() or "process cannot access" in str(e).lower():
+                console.print("[dim yellow][!] Stale browser session detected. Auto-recovering profile...[/dim yellow]")
+                self._cleanup_stale_locks()
+                await asyncio.sleep(1.0)
+                self.context = await self._pw.chromium.launch_persistent_context(
+                    user_data_dir=USER_DATA_DIR,
+                    headless=self.headless,
+                    viewport={"width": 1280, "height": 850},
+                    user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+                    args=[
+                        "--disable-blink-features=AutomationControlled",
+                        "--no-sandbox",
+                        "--disable-setuid-sandbox",
+                        "--disable-infobars",
+                        "--window-size=1280,850"
+                    ]
+                )
+            else:
+                raise e
+
         self.page = await self.context.new_page()
         # Set default action timeout to 6 seconds instead of 30 seconds to never freeze
         self.page.set_default_timeout(6000)
@@ -388,6 +450,7 @@ class BinanceRedeemer:
         """
         Examines inline form error messages, dialogs, modals, toasts, and DOM text
         to accurately classify the result of a redemption attempt.
+        Only inspects VISIBLE elements to prevent false positives from stale DOM nodes.
         """
         if not self.page:
             return {"status": "no_page", "message": "No active browser page"}
@@ -395,13 +458,22 @@ class BinanceRedeemer:
         try:
             raw_feedback = await self.page.evaluate("""() => {
                 const texts = [];
-                
+                const isVisible = (el) => {
+                    if (!el) return false;
+                    const style = window.getComputedStyle(el);
+                    return style.display !== 'none' && 
+                           style.visibility !== 'hidden' && 
+                           style.opacity !== '0' && 
+                           (el.offsetWidth > 0 || el.offsetHeight > 0 || el.getClientRects().length > 0);
+                };
+
                 // 1. Check known feedback / form error selector containers
                 const selectors = [
                     '.bn-form-item-explain',
                     '.bn-form-item-error',
                     '.bn-feedback',
                     '.toast',
+                    '.bn-toast',
                     '.bn-modal',
                     '.openbox',
                     '[role="alert"]',
@@ -414,45 +486,41 @@ class BinanceRedeemer:
                     'div[class*="warning" i]',
                     'div[class*="Toast" i]'
                 ];
-                
+
                 for (const sel of selectors) {
                     try {
                         const elements = document.querySelectorAll(sel);
                         elements.forEach(el => {
-                            if (el && el.innerText && el.innerText.trim()) {
+                            if (isVisible(el) && el.innerText && el.innerText.trim()) {
                                 texts.push(el.innerText.trim());
                             }
                         });
                     } catch (e) {}
                 }
-                
+
                 // 2. Check input container and its parents (captures inline form validation errors)
                 const input = document.querySelector('input[type="text"], input[name="code"], input[placeholder*="code" i], input[placeholder*="Crypto" i]');
                 if (input) {
                     let parent = input.parentElement;
                     for (let i = 0; i < 5 && parent; i++) {
-                        const pText = (parent.innerText || '').trim();
-                        if (pText && (
-                            pText.includes('exceeded') || 
-                            pText.includes('attempt') || 
-                            pText.includes('try again') || 
-                            pText.includes('invalid') || 
-                            pText.includes('expired') || 
-                            pText.includes('claimed') || 
-                            pText.includes('exist')
-                        )) {
-                            texts.push(pText);
+                        if (isVisible(parent)) {
+                            const pText = (parent.innerText || '').trim();
+                            if (pText && (
+                                pText.includes('exceeded') || 
+                                pText.includes('attempt') || 
+                                pText.includes('try again') || 
+                                pText.includes('invalid') || 
+                                pText.includes('expired') || 
+                                pText.includes('claimed') || 
+                                pText.includes('exist')
+                            )) {
+                                texts.push(pText);
+                            }
                         }
                         parent = parent.parentElement;
                     }
                 }
-                
-                // 3. Fallback body check for maximum attempt phrases
-                const bodyText = document.body ? (document.body.innerText || '') : '';
-                if (bodyText.includes('exceeded the maximum attempts') || bodyText.includes('maximum attempts for entering')) {
-                    texts.push(bodyText);
-                }
-                
+
                 return texts.join('\\n');
             }""")
         except Exception:
@@ -480,7 +548,6 @@ class BinanceRedeemer:
                 lockout_msg = raw_feedback[:120].strip()
 
             duration = parse_lockout_duration(raw_feedback)
-            self.set_lockout(duration, lockout_msg)
 
             return {
                 "status": "rate_limited",
@@ -615,15 +682,6 @@ class BinanceRedeemer:
                     if needs_reload or await self._is_500_error_page():
                         await self._recover_from_500_error(CRYPTO_BOX_URL)
 
-                    # Check if page already displays active lockout banner
-                    pre_fb = await self._extract_page_feedback()
-                    if pre_fb.get("status") == "rate_limited":
-                        console.print(f"[bold red]🚫 BINANCE LOCKOUT DETECTED ON PAGE: {pre_fb['message']}[/bold red]")
-                        result["status"] = "rate_limited"
-                        result["message"] = pre_fb["message"]
-                        result["retry_after"] = pre_fb.get("retry_after")
-                        return result
-
                     # Locate input field
                     input_field = await self._find_crypto_box_input()
 
@@ -737,6 +795,7 @@ class BinanceRedeemer:
                                 console.print(f"[bold gold1]🎉 [SUCCESS] Successfully opened Red Packet '{code}'![/bold gold1]")
                                 result["status"] = "success"
                                 result["message"] = "Red Packet opened"
+                                self.clear_lockout()
                                 self._reset_circuit_breaker()
                                 opened = True
                                 break
@@ -750,28 +809,33 @@ class BinanceRedeemer:
                         fb_msg = fb.get("message", "")
 
                         if status == "rate_limited":
+                            duration = fb.get("retry_after") or parse_lockout_duration(fb_msg)
+                            self.set_lockout(duration, fb_msg)
                             rem_str = self.get_lockout_remaining_str()
                             console.print(f"[bold red]🚫 BINANCE RATE LIMIT DETECTED: {fb_msg}[/bold red]")
                             console.print(f"[bold red]⏳ Auto-claimer is paused. Cooldown expires in: {rem_str}[/bold red]")
                             result["status"] = "rate_limited"
                             result["message"] = fb_msg
-                            result["retry_after"] = fb.get("retry_after")
+                            result["retry_after"] = duration
                             await self._dismiss_modals()
                             return result
 
                         elif status == "expired":
+                            self.clear_lockout()
                             console.print(f"[yellow][i] Code '{code}' is EXPIRED or fully claimed by others.[/yellow]")
                             result["status"] = "expired"
                             result["message"] = "Expired or fully claimed"
                             await self._handle_circuit_breaker()
 
                         elif status == "already_claimed":
+                            self.clear_lockout()
                             console.print(f"[yellow][i] You have already claimed code '{code}'.[/yellow]")
                             result["status"] = "already_claimed"
                             result["message"] = "Already claimed"
                             await self._human_delay(1.0, 2.0)
 
                         elif status == "invalid":
+                            self.clear_lockout()
                             console.print(f"[red][!] Code '{code}' is invalid.[/red]")
                             result["status"] = "invalid"
                             result["message"] = "Invalid code"
@@ -957,6 +1021,7 @@ class BinanceRedeemer:
                                 console.print(f"[bold gold1]🎉 [SUCCESS] Red Packet Opened for post {post_url}![/bold gold1]")
                                 result["status"] = "success"
                                 result["message"] = "Red Packet opened"
+                                self.clear_lockout()
                                 self._reset_circuit_breaker()
                                 await self._dismiss_modals()
                                 await self._human_delay(1.8, 3.5)
@@ -964,6 +1029,7 @@ class BinanceRedeemer:
                         except Exception:
                             pass
 
+                        self.clear_lockout()
                         result["status"] = "submitted"
                         result["message"] = "Answer submitted"
                     else:
@@ -1030,11 +1096,14 @@ class BinanceRedeemer:
                             await open_btn.click(timeout=2000, force=True)
                             console.print(f"[bold gold1]🎉 [SUCCESS] Clicked Open on Red Packet link![/bold gold1]")
                             result["status"] = "success"
+                            self.clear_lockout()
                             self._reset_circuit_breaker()
                             await self._dismiss_modals()
                         else:
+                            self.clear_lockout()
                             result["status"] = "opened"
                     except Exception:
+                        self.clear_lockout()
                         result["status"] = "opened"
 
                     return result

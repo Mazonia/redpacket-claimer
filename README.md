@@ -103,11 +103,20 @@ Start the application:
 python main.py
 ```
 
+### CLI Command Options:
+| Flag | Description | Example |
+| :--- | :--- | :--- |
+| `--catchup <N>` | Sweep and claim up to `N` recent missed drops from channels (default: `35`) | `python main.py --catchup 35` |
+| `--clear-lockout` | Instantly reset/clear any saved Binance lockout state | `python main.py --clear-lockout` |
+| `--clear-cache` | Clear the claimed codes history cache | `python main.py --clear-cache` |
+| `--headless` | Force headless Chromium browser execution | `python main.py --headless` |
+| `--headful` | Force visible Chromium browser execution | `python main.py --headful` |
+
 ### First-Time Run Flow:
 1. **Telegram Authorization**: Telethon will connect using your phone number and prompt for the 5-digit code sent to your Telegram app. This generates your local `binance_session.session`.
 2. **Binance Session**: Chromium will open to `https://www.binance.com/en/my/wallet/account/payment/cryptobox`. Log in manually (solve 2FA). Your session is saved to `./user_data/` so you won't need to log in again.
 3. **Catch-Up & Live Monitoring**:
-   - The bot scans channel history for fresh drops (< 3 minutes old) while pre-caching old drops.
+   - The bot performs an intelligent sweep of channel history for recent unredeemed drops and auto-claims them.
    - It then remains running in the background, claiming new drops with stealth delays and circuit breaker protection!
 
 ---
