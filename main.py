@@ -40,6 +40,8 @@ def parse_cli_args():
     parser.add_argument("--clear-cache", action="store_true", help="Clear claimed codes cache")
     parser.add_argument("--headless", action="store_true", help="Force headless browser mode")
     parser.add_argument("--headful", action="store_true", help="Force visible browser mode")
+    parser.add_argument("--enable-square", action="store_true", help="Enable Binance Square Comment-to-Earn quiz claims")
+    parser.add_argument("--disable-square", action="store_true", help="Disable Binance Square Comment-to-Earn quiz claims (focus purely on Red Packets)")
     args, _ = parser.parse_known_args()
     return args
 
@@ -48,6 +50,7 @@ API_HASH = os.getenv("TELEGRAM_API_HASH")
 PHONE = os.getenv("TELEGRAM_PHONE", "").strip()
 TARGET_CHANNEL_RAW = os.getenv("TARGET_CHANNEL", "").strip()
 HEADLESS_MODE = os.getenv("HEADLESS", "false").lower() == "true"
+ENABLE_SQUARE_CLAIMS = os.getenv("ENABLE_SQUARE_CLAIMS", "false").strip().lower() in ("true", "1", "yes")
 
 TARGET_CHANNELS = [c.strip() for c in TARGET_CHANNEL_RAW.split(",") if c.strip()]
 
@@ -274,7 +277,7 @@ async def scan_and_claim_history(channel_entities: List[Any], catchup_limit: int
                     continue
 
                 msg_age_seconds = (now - msg.date).total_seconds()
-                parsed = parse_telegram_message(msg.raw_text)
+                parsed = parse_telegram_message(msg)
 
                 for c in parsed.get("codes", []):
                     if c in claimed_items:
@@ -292,24 +295,41 @@ async def scan_and_claim_history(channel_entities: List[Any], catchup_limit: int
                             "channel": chat_name
                         })
 
-                sq_urls = parsed.get("square_urls", [])
-                answers = parsed.get("answers", [])
-                if sq_urls and answers:
-                    url = sq_urls[0]
-                    ans = answers[0]
-                    if url not in claimed_items:
-                        if msg_age_seconds > 86400:
-                            claimed_items.add(url)
-                            ancient_codes_indexed += 1
-                        else:
-                            channel_items.append({
-                                "type": "square",
-                                "identifier": url,
-                                "extra": ans,
-                                "date": msg.date,
-                                "age_s": int(msg_age_seconds),
-                                "channel": chat_name
-                            })
+                for rp_url in parsed.get("red_packet_urls", []):
+                    if rp_url in claimed_items:
+                        continue
+                    if msg_age_seconds > 86400:
+                        claimed_items.add(rp_url)
+                        ancient_codes_indexed += 1
+                    else:
+                        channel_items.append({
+                            "type": "url",
+                            "identifier": rp_url,
+                            "extra": "",
+                            "date": msg.date,
+                            "age_s": int(msg_age_seconds),
+                            "channel": chat_name
+                        })
+
+                if ENABLE_SQUARE_CLAIMS:
+                    sq_urls = parsed.get("square_urls", [])
+                    answers = parsed.get("answers", [])
+                    if sq_urls and answers:
+                        url = sq_urls[0]
+                        ans = answers[0]
+                        if url not in claimed_items:
+                            if msg_age_seconds > 86400:
+                                claimed_items.add(url)
+                                ancient_codes_indexed += 1
+                            else:
+                                channel_items.append({
+                                    "type": "square",
+                                    "identifier": url,
+                                    "extra": ans,
+                                    "date": msg.date,
+                                    "age_s": int(msg_age_seconds),
+                                    "channel": chat_name
+                                })
 
             # Sort channel drops chronologically (oldest in the recent window first)
             channel_items.sort(key=lambda x: x["date"])
@@ -370,7 +390,7 @@ async def live_message_handler(event):
     if event.message and event.message.date:
         msg_timestamp = event.message.date.timestamp()
 
-    parsed = parse_telegram_message(message_text)
+    parsed = parse_telegram_message(event.message if event.message else message_text)
     codes = parsed.get("codes", [])
     square_urls = parsed.get("square_urls", [])
     red_packet_urls = parsed.get("red_packet_urls", [])
@@ -380,9 +400,14 @@ async def live_message_handler(event):
         console.print("[dim][i] Post received, but no red packet codes or reward links found.[/dim]\n")
         return
 
-    for sq_url in square_urls:
-        ans = answers[0] if answers else ""
-        await process_single_item("square", sq_url, ans, timestamp=msg_timestamp)
+    # Handle Square Posts
+    if square_urls:
+        if ENABLE_SQUARE_CLAIMS:
+            for sq_url in square_urls:
+                ans = answers[0] if answers else ""
+                await process_single_item("square", sq_url, ans, timestamp=msg_timestamp)
+        else:
+            console.print(f"[dim]ℹ️ Binance Square drop detected ({len(square_urls)} post{'s' if len(square_urls)>1 else ''}), but Square claims are disabled (focused on Red Packets). Set ENABLE_SQUARE_CLAIMS=true in .env to enable.[/dim]\n")
 
     for code in codes:
         await process_single_item("code", code, timestamp=msg_timestamp)
@@ -555,6 +580,10 @@ async def lockout_queue_monitor():
                 if identifier in claimed_items:
                     continue
 
+                if item_type == "square" and not ENABLE_SQUARE_CLAIMS:
+                    console.print(f"[dim]↷ Skipping held Square drop '{identifier}' (Square claims currently disabled).[/dim]")
+                    continue
+
                 age = now_ts - ts
                 if age > 86400:  # Older than 24 hours
                     console.print(f"[dim yellow]↷ Skipping held {item_type} '{identifier}' ({int(age)}s old) — ancient drop to protect account.[/dim yellow]")
@@ -581,13 +610,18 @@ async def lockout_queue_monitor():
 async def main():
     cli_args = parse_cli_args()
 
-    global HEADLESS_MODE
+    global HEADLESS_MODE, ENABLE_SQUARE_CLAIMS
     if cli_args.headless:
         HEADLESS_MODE = True
         redeemer.headless = True
     elif cli_args.headful:
         HEADLESS_MODE = False
         redeemer.headless = False
+
+    if cli_args.enable_square:
+        ENABLE_SQUARE_CLAIMS = True
+    elif cli_args.disable_square:
+        ENABLE_SQUARE_CLAIMS = False
 
     if cli_args.clear_lockout:
         redeemer.clear_lockout()
@@ -600,11 +634,13 @@ async def main():
 
     is_locked, remaining_s, remaining_str = redeemer.is_locked_out()
     lockout_status = f"[bold red]Active ({remaining_str} remaining)[/bold red]" if is_locked else "[bold green]Clear (Ready to Claim)[/bold green]"
+    square_status = "[bold green]Enabled[/bold green]" if ENABLE_SQUARE_CLAIMS else "[dim yellow]Disabled (100% Focused on Red Packets)[/dim yellow]"
 
     table = Table(title="🚀 Binance Red Packet & Feed Auto-Claimer", show_header=True, header_style="bold magenta")
     table.add_column("Setting", style="dim", width=25)
     table.add_column("Value", style="bold green")
     table.add_row("Target Channels", ", ".join(TARGET_CHANNELS))
+    table.add_row("Square / Feed Claims", square_status)
     table.add_row("Browser Mode", "Headless" if HEADLESS_MODE else "Visible (Headful)")
     table.add_row("Redemption URL", "https://www.binance.com/en/my/wallet/account/payment/cryptobox")
     table.add_row("Session Directory", "./user_data")

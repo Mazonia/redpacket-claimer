@@ -50,13 +50,58 @@ def extract_red_packet_codes(text: str) -> List[str]:
 
     return list(codes)
 
-def extract_square_urls(text: str) -> List[str]:
-    """Extract Binance Square post links."""
-    return re.findall(BINANCE_SQUARE_URL_PATTERN, text, re.IGNORECASE)
+def extract_urls_from_entities(text: str = "", entities: Any = None) -> List[str]:
+    """
+    Extract URLs embedded in Telegram message entities (such as hidden hyperlinks behind anchor text).
+    """
+    urls = []
+    if not entities:
+        return urls
 
-def extract_red_packet_urls(text: str) -> List[str]:
-    """Extract direct s.binance.com red packet claim links."""
-    return re.findall(BINANCE_RED_PACKET_URL_PATTERN, text, re.IGNORECASE)
+    for ent in entities:
+        # 1. Telethon MessageEntityTextUrl (hidden hyperlink behind anchor text)
+        url = getattr(ent, 'url', None)
+        if url and isinstance(url, str):
+            urls.append(url.strip())
+            continue
+
+        # 2. Dict format if serialized JSON
+        if isinstance(ent, dict):
+            dict_url = ent.get('url')
+            if dict_url and isinstance(dict_url, str):
+                urls.append(dict_url.strip())
+                continue
+
+        # 3. MessageEntityUrl (plaintext URL offset/length in text)
+        if hasattr(ent, 'offset') and hasattr(ent, 'length') and text:
+            type_name = type(ent).__name__
+            if 'Url' in type_name and not getattr(ent, 'url', None):
+                try:
+                    raw_sub = text[ent.offset:ent.offset + ent.length].strip()
+                    if raw_sub.startswith("http://") or raw_sub.startswith("https://"):
+                        urls.append(raw_sub)
+                except Exception:
+                    pass
+
+    return urls
+
+def extract_square_urls(text: str, entities: Any = None) -> List[str]:
+    """Extract Binance Square post links from text and Telegram message entities."""
+    raw_urls = re.findall(BINANCE_SQUARE_URL_PATTERN, text, re.IGNORECASE)
+    if entities:
+        for u in extract_urls_from_entities(text, entities):
+            if re.search(BINANCE_SQUARE_URL_PATTERN, u, re.IGNORECASE):
+                raw_urls.append(u)
+    return list(dict.fromkeys(raw_urls))
+
+def extract_red_packet_urls(text: str, entities: Any = None) -> List[str]:
+    """Extract direct s.binance.com red packet claim links from text and Telegram message entities."""
+    raw_urls = re.findall(BINANCE_RED_PACKET_URL_PATTERN, text, re.IGNORECASE)
+    if entities:
+        for u in extract_urls_from_entities(text, entities):
+            if re.search(BINANCE_RED_PACKET_URL_PATTERN, u, re.IGNORECASE):
+                raw_urls.append(u)
+    return list(dict.fromkeys(raw_urls))
 
 def extract_quiz_answers(text: str) -> List[str]:
     """
@@ -81,13 +126,21 @@ def extract_quiz_answers(text: str) -> List[str]:
 
     return answers
 
-def parse_telegram_message(text: str) -> Dict[str, Any]:
+def parse_telegram_message(message_or_text: Any, entities: Any = None) -> Dict[str, Any]:
     """
     Parse a full Telegram message and extract all actionable reward items.
+    Accepts raw text, a Telethon Message object, or (text, entities).
     """
+    if hasattr(message_or_text, 'raw_text'):
+        text = message_or_text.raw_text or ""
+        if entities is None and hasattr(message_or_text, 'entities'):
+            entities = message_or_text.entities
+    else:
+        text = str(message_or_text or "")
+
     codes = extract_red_packet_codes(text)
-    square_urls = extract_square_urls(text)
-    red_packet_urls = extract_red_packet_urls(text)
+    square_urls = extract_square_urls(text, entities=entities)
+    red_packet_urls = extract_red_packet_urls(text, entities=entities)
     answers = extract_quiz_answers(text)
 
     # Format Binance Square URLs to canonical web form:
@@ -103,9 +156,9 @@ def parse_telegram_message(text: str) -> Dict[str, Any]:
             formatted_square_urls.append(base_url)
 
     return {
-        "codes": codes,
-        "square_urls": formatted_square_urls,
-        "red_packet_urls": red_packet_urls,
+        "codes": list(dict.fromkeys(codes)),
+        "square_urls": list(dict.fromkeys(formatted_square_urls)),
+        "red_packet_urls": list(dict.fromkeys(red_packet_urls)),
         "answers": answers,
         "raw_text": text
     }

@@ -92,6 +92,11 @@ python -m playwright install chromium
    # Playwright Configuration
    HEADLESS=false
    USER_DATA_DIR=./user_data
+
+   # Feature Toggle: Binance Square / Feed Comment-to-Earn Quiz Claims
+   # false (default): 100% focused on high-speed Red Packet / Crypto Box codes
+   # true: also opens Binance Square posts to submit answers and claim rewards
+   ENABLE_SQUARE_CLAIMS=false
    ```
 
 ---
@@ -111,6 +116,8 @@ python main.py
 | `--clear-cache` | Clear the claimed codes history cache | `python main.py --clear-cache` |
 | `--headless` | Force headless Chromium browser execution | `python main.py --headless` |
 | `--headful` | Force visible Chromium browser execution | `python main.py --headful` |
+| `--enable-square` | Enable Binance Square Comment-to-Earn quiz claims for this run | `python main.py --enable-square` |
+| `--disable-square` | Disable Binance Square claims (focus 100% on Red Packets) | `python main.py --disable-square` |
 
 ### First-Time Run Flow:
 1. **Telegram Authorization**: Telethon will connect using your phone number and prompt for the 5-digit code sent to your Telegram app. This generates your local `binance_session.session`.
