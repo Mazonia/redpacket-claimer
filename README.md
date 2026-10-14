@@ -20,18 +20,21 @@ A high-performance, automated Python application that monitors Telegram channels
   - **Circuit Breaker System**: Automatically halts claims for 75 seconds if multiple consecutive dead/invalid codes are encountered, avoiding anti-bruteforce account lockouts.
   - **Smart Historical Freshness Gating**: Only attempts to claim drops younger than 3 minutes; older historical codes are automatically pre-cached without submitting dead codes to Binance.
 
+- **📶 Unstable & Low-Bandwidth Internet Resilience**:
+  - **In-Page Session Recycling**: Reuses the active Crypto Box page and input field without re-downloading megabytes of Binance single-page-app bundles for every code, slashing bandwidth by 95% and eliminating reload errors.
+  - **In-Flight Response Awaiting**: Actively polls for up to 12s and detects button loading spinners to wait for slow backend responses over high-latency cellular/Wi-Fi without premature timeouts.
+  - **Page Chrome & Locale Noise Filtering**: Filters out site-wide navbar headers, footers, and currency/language dialogs, eliminating false-positive unknown statuses (e.g. *"English English USD-$"*).
+  - **Automated Transient Retries**: Automatically retries codes up to 3 times with session recovery on server errors (500/502/503/504) or network latency timeouts instead of dropping them.
+  - **Comprehensive Offline & Network Error Recovery**: Detects both Binance HTTP server errors and Chromium network disconnection screens (`ERR_INTERNET_DISCONNECTED`, `ERR_NAME_NOT_RESOLVED`, `ERR_CONNECTION_RESET`, `ERR_TIMED_OUT`) with progressive backoff navigation.
+  - **Fast-Recovery Reconnect Ladder**: Rapid reconnection schedule starting at 5s (`5s` ➔ `10s` ➔ `20s` ➔ `30s` ➔ `1 min` ➔ `3 min` ➔ `5 min` ➔ `10 min` ➔ `20 min` ➔ `30 min`), ensuring brief connection drops are recovered within seconds.
+  - **Held Drops Queue Recovery**: Automatically queues fresh drops received during network outages and claims them the moment connection is restored.
+
 - **💾 Local Cache & Duplicate Prevention**:
   - Keeps a local `claimed_cache.json` to prevent re-submitting previously processed codes.
 
 - **🔐 100% Private & Persistent Session**:
   - **Telegram Session**: Telethon runs locally on your machine. No tokens or messages are shared externally.
   - **Binance Session**: Uses Playwright's persistent Chromium browser context (`./user_data/`). Log into Binance **once** manually with 2FA; your session is preserved across runs.
-
-- **🌐 Stepped Internet & Telegram Auto-Reconnection**:
-  - Automatically recovers from internet outages and Telegram disconnections using a stepped backoff schedule:
-    `30s` ➔ `1 min` ➔ `3 min` ➔ `5 min` ➔ `10 min` ➔ `20 min` ➔ `30 min` ➔ `45 min`.
-  - Built-in MTProto keepalive watchdog detects silent dropped connections quickly.
-  - Automatically performs an intelligent channel history sweep upon reconnection to catch and claim any fresh drops (< 3 minutes old) that arrived while offline.
 
 - **🎨 Modern Rich Terminal UI**:
   - Colored tables, live drop panels, lockout countdown status, reconnection spinners, and humanized stealth delays.
@@ -42,10 +45,12 @@ A high-performance, automated Python application that monitors Telegram channels
 
 ```
 binance-auto-claimer/
-├── main.py            # Orchestrator: Freshness filtering, Telegram listener & dispatcher
+├── main.py            # Orchestrator: Freshness filtering, Telegram listener, watchdog & dispatcher
 ├── parser.py          # Regex parser: Isolates 8-char codes, Binance Square links & answers
-├── redemption.py      # Playwright engine: Lockout tracker, circuit breaker & claiming
+├── redemption.py      # Playwright engine: In-flight awaiter, noise filter, error recovery & claiming
+├── test_claimer.py    # Test suite: Comprehensive unit tests for parser, redemption & reconnect
 ├── requirements.txt   # Python dependencies
+├── run.bat            # Windows launcher (runs as dedicated redpacket-claimer.exe)
 ├── .env.example       # Template configuration file
 ├── .gitignore         # Protects credentials, session files, and browser cookies
 └── README.md          # Project documentation
@@ -135,6 +140,16 @@ python main.py
 
 ---
 
+## 🧪 Running Tests
+
+Execute the built-in comprehensive unit test suite:
+```bash
+python -m unittest test_claimer.py -v
+```
+
+---
+
 ## 📜 License
 
 MIT License. For educational and personal automation purposes.
+

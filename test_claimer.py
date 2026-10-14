@@ -1,0 +1,253 @@
+import os
+import unittest
+from unittest.mock import MagicMock, AsyncMock, patch
+
+from parser import (
+    extract_red_packet_codes,
+    extract_urls_from_entities,
+    extract_square_urls,
+    extract_red_packet_urls,
+    extract_quiz_answers,
+    parse_telegram_message,
+)
+from redemption import (
+    parse_lockout_duration,
+    format_duration,
+    BinanceRedeemer,
+)
+from main import (
+    get_backoff_delay,
+    format_delay_text,
+    format_phone_number,
+    RETRY_DELAYS,
+)
+
+
+class TestParser(unittest.TestCase):
+    def test_extract_emoji_codes(self):
+        text = "New drop alert! 🎁 I8C23DTN claim now fast!"
+        codes = extract_red_packet_codes(text)
+        self.assertIn("I8C23DTN", codes)
+
+    def test_extract_bp_codes(self):
+        text = "Binance Pay code: BP7XY89Z claim it"
+        codes = extract_red_packet_codes(text)
+        self.assertIn("BP7XY89Z", codes)
+
+    def test_extract_generic_codes(self):
+        text = "Crypto Box code: 029G7T77 and DDOD8UZ9"
+        codes = extract_red_packet_codes(text)
+        self.assertIn("029G7T77", codes)
+        self.assertIn("DDOD8UZ9", codes)
+
+    def test_strip_urls_from_code_extraction(self):
+        # Prevent URL parameters like ?ref=YNGX16JK from being extracted as codes
+        text = "Check out https://www.binance.com/activity?ref=YNGX16JK for details"
+        codes = extract_red_packet_codes(text)
+        self.assertNotIn("YNGX16JK", codes)
+
+    def test_ignored_words_filtered(self):
+        text = "BINANCE REWARDS ACTIVITY DOWNLOAD"
+        codes = extract_red_packet_codes(text)
+        self.assertEqual(len(codes), 0)
+
+    def test_extract_square_urls(self):
+        text = "Check this post: https://www.binance.com/en/square/post/371921171275162"
+        urls = extract_square_urls(text)
+        self.assertIn("https://www.binance.com/en/square/post/371921171275162", urls)
+
+    def test_extract_red_packet_urls(self):
+        text = "Claim direct link: https://s.binance.com/abcdef12"
+        urls = extract_red_packet_urls(text)
+        self.assertIn("https://s.binance.com/abcdef12", urls)
+
+    def test_extract_square_answers(self):
+        text = "Binance Square Quiz Answer: 𝑨𝒏𝒔𝒘𝒆𝒓 :❕20.8k❕"
+        answers = extract_quiz_answers(text)
+        self.assertIn("20.8k", answers)
+
+    def test_parse_telegram_message(self):
+        text = "🎁 DDOD8UZ9 https://s.binance.com/abcdef12"
+        parsed = parse_telegram_message(text)
+        self.assertIn("DDOD8UZ9", parsed["codes"])
+        self.assertIn("https://s.binance.com/abcdef12", parsed["red_packet_urls"])
+
+
+class TestRedemptionHelpers(unittest.TestCase):
+    def test_parse_lockout_duration_hours_minutes(self):
+        text = "You have exceeded the maximum attempts. Please try again in 04 hour(s) and 19 minute(s)."
+        seconds = parse_lockout_duration(text)
+        expected = 4 * 3600 + 19 * 60
+        self.assertEqual(seconds, expected)
+
+    def test_parse_lockout_duration_minutes_seconds(self):
+        text = "Too many attempts. Try again in 15 minute(s) and 30 second(s)."
+        seconds = parse_lockout_duration(text)
+        expected = 15 * 60 + 30
+        self.assertEqual(seconds, expected)
+
+    def test_parse_lockout_duration_fallback(self):
+        text = "Rate limit reached. Please try later."
+        seconds = parse_lockout_duration(text)
+        self.assertEqual(seconds, 300)
+
+    def test_format_duration(self):
+        self.assertEqual(format_duration(3665), "01 hour(s) and 01 minute(s)")
+        self.assertEqual(format_duration(125), "02 minute(s) and 05 second(s)")
+        self.assertEqual(format_duration(45), "45 second(s)")
+
+    def test_lockout_state_management(self):
+        redeemer = BinanceRedeemer(headless=True)
+        redeemer.clear_lockout()
+        is_locked, rem_s, rem_str = redeemer.is_locked_out()
+        self.assertFalse(is_locked)
+
+        redeemer.set_lockout(60, "Testing lockout")
+        is_locked, rem_s, rem_str = redeemer.is_locked_out()
+        self.assertTrue(is_locked)
+        self.assertGreater(rem_s, 0)
+
+        redeemer.clear_lockout()
+        is_locked, _, _ = redeemer.is_locked_out()
+        self.assertFalse(is_locked)
+
+    def test_circuit_breaker(self):
+        redeemer = BinanceRedeemer(headless=True)
+        redeemer._reset_circuit_breaker()
+        self.assertEqual(redeemer.consecutive_failures, 0)
+
+
+class TestPageFeedbackNoiseFiltering(unittest.IsolatedAsyncioTestCase):
+    async def test_locale_noise_ignored(self):
+        """Verify that 'English English USD-$ USD-$' is recognized as noise and filtered out."""
+        redeemer = BinanceRedeemer(headless=True)
+        mock_page = AsyncMock()
+        mock_page.evaluate.return_value = "English\nEnglish\nUSD-$ USD-$"
+        redeemer.page = mock_page
+
+        fb = await redeemer._extract_page_feedback()
+        self.assertEqual(fb.get("status"), "no_response")
+        self.assertNotEqual(fb.get("status"), "unknown")
+
+    async def test_genuine_expired_classified(self):
+        redeemer = BinanceRedeemer(headless=True)
+        mock_page = AsyncMock()
+        mock_page.evaluate.return_value = "All rewards have been claimed"
+        redeemer.page = mock_page
+
+        fb = await redeemer._extract_page_feedback()
+        self.assertEqual(fb.get("status"), "expired")
+
+    async def test_genuine_rate_limit_classified(self):
+        redeemer = BinanceRedeemer(headless=True)
+        mock_page = AsyncMock()
+        mock_page.evaluate.return_value = "You have exceeded the maximum attempts. Please try again in 01 hour(s)."
+        redeemer.page = mock_page
+
+        fb = await redeemer._extract_page_feedback()
+        self.assertEqual(fb.get("status"), "rate_limited")
+        self.assertEqual(fb.get("retry_after"), 3600)
+
+    async def test_genuine_already_claimed_classified(self):
+        redeemer = BinanceRedeemer(headless=True)
+        mock_page = AsyncMock()
+        mock_page.evaluate.return_value = "You have already claimed this Crypto Box"
+        redeemer.page = mock_page
+
+        fb = await redeemer._extract_page_feedback()
+        self.assertEqual(fb.get("status"), "already_claimed")
+
+    async def test_error_page_detection_server_errors(self):
+        redeemer = BinanceRedeemer(headless=True)
+        mock_page = AsyncMock()
+        mock_page.url = "https://www.binance.com/en/my/wallet/account/payment/cryptobox"
+        mock_page.query_selector.return_value = None
+        mock_page.evaluate.return_value = "500 Internal Server Error. Something went wrong."
+        redeemer.page = mock_page
+
+        is_error = await redeemer._is_error_page()
+        self.assertTrue(is_error)
+
+    async def test_error_page_detection_network_offline(self):
+        redeemer = BinanceRedeemer(headless=True)
+        mock_page = AsyncMock()
+        mock_page.url = "chrome-error://chromewebdata/"
+        mock_page.query_selector.return_value = None
+        mock_page.evaluate.return_value = "This site can't be reached. ERR_INTERNET_DISCONNECTED"
+        redeemer.page = mock_page
+
+        is_error = await redeemer._is_error_page()
+        self.assertTrue(is_error)
+
+    async def test_wait_for_claim_outcome_open_success(self):
+        redeemer = BinanceRedeemer(headless=True)
+        mock_page = AsyncMock()
+        mock_page.url = "https://www.binance.com/en/my/wallet/account/payment/cryptobox"
+        mock_open_btn = AsyncMock()
+        mock_open_btn.is_visible.return_value = True
+
+        async def mock_query(sel):
+            if "Open" in sel:
+                return mock_open_btn
+            return None
+
+        mock_page.query_selector = mock_query
+        mock_page.evaluate.return_value = ""
+        redeemer.page = mock_page
+
+        outcome = await redeemer._wait_for_claim_outcome("TESTCODE", timeout_seconds=2.0)
+        self.assertEqual(outcome.get("status"), "success")
+        mock_open_btn.click.assert_called()
+
+    async def test_wait_for_claim_outcome_network_timeout(self):
+        redeemer = BinanceRedeemer(headless=True)
+        mock_page = AsyncMock()
+        mock_page.url = "https://www.binance.com/en/my/wallet/account/payment/cryptobox"
+        mock_page.query_selector.return_value = None
+        
+        async def mock_eval(script):
+            if "claimBtn" in script or "spin" in script:
+                return True
+            return ""
+
+        mock_page.evaluate = mock_eval
+        redeemer.page = mock_page
+
+        outcome = await redeemer._wait_for_claim_outcome("TESTCODE", timeout_seconds=0.8)
+        self.assertEqual(outcome.get("status"), "network_timeout")
+
+    async def test_wait_for_claim_outcome_server_error(self):
+        redeemer = BinanceRedeemer(headless=True)
+        mock_page = AsyncMock()
+        mock_page.url = "https://www.binance.com/en/my/wallet/account/payment/cryptobox"
+        mock_page.query_selector.return_value = None
+        mock_page.evaluate.return_value = "500 Internal Server Error"
+        redeemer.page = mock_page
+
+        outcome = await redeemer._wait_for_claim_outcome("TESTCODE", timeout_seconds=1.0)
+        self.assertEqual(outcome.get("status"), "server_error")
+
+
+class TestMainNetworkManagement(unittest.TestCase):
+    def test_backoff_delays(self):
+        self.assertEqual(get_backoff_delay(0), 5)
+        self.assertEqual(get_backoff_delay(1), 10)
+        self.assertEqual(get_backoff_delay(2), 20)
+        self.assertEqual(get_backoff_delay(3), 30)
+        self.assertEqual(get_backoff_delay(4), 60)
+        self.assertEqual(get_backoff_delay(99), RETRY_DELAYS[-1])
+
+    def test_format_delay_text(self):
+        self.assertEqual(format_delay_text(5), "5s")
+        self.assertEqual(format_delay_text(30), "30s")
+        self.assertEqual(format_delay_text(60), "1 min")
+        self.assertEqual(format_delay_text(90), "1 min 30s")
+        self.assertEqual(format_delay_text(300), "5 min")
+
+    def test_format_phone_number(self):
+        self.assertEqual(format_phone_number("+1234567890"), "+1234567890")
+        self.assertEqual(format_phone_number(" +1 234-567-890 "), "+1234567890")
+
+
+if __name__ == "__main__":
+    unittest.main()

@@ -186,11 +186,22 @@ class BinanceRedeemer:
         except Exception:
             pass
 
-    async def _is_500_error_page(self) -> bool:
-        """Detects if Binance is displaying a 500 error / 'something went wrong' page."""
+    async def _is_error_page(self) -> bool:
+        """
+        Detects if Binance or Chromium is displaying an error screen:
+        - HTTP 500, 502, 503, 504 server error
+        - "Something went wrong" / "Go to Home"
+        - Chrome offline / connection errors (ERR_INTERNET_DISCONNECTED, ERR_NAME_NOT_RESOLVED,
+          ERR_CONNECTION_RESET, ERR_CONNECTION_TIMED_OUT, etc.)
+        - chrome-error:// pages
+        """
         if not self.page:
             return False
         try:
+            url = (self.page.url or "").lower()
+            if "chrome-error://" in url or "chromewebdata" in url:
+                return True
+
             home_btn = await self.page.query_selector('button:has-text("Go to Home"), a:has-text("Go to Home"), div[role="button"]:has-text("Go to Home")')
             if home_btn and await home_btn.is_visible():
                 return True
@@ -198,42 +209,82 @@ class BinanceRedeemer:
             body_text = await self.page.evaluate("() => document.body ? document.body.innerText : ''")
             text_lower = body_text.lower()
 
-            if "500" in body_text and ("something went wrong" in text_lower or "we're sorry" in text_lower or "go to home" in text_lower):
-                return True
-            if "internal server error" in text_lower or "502 bad gateway" in text_lower or "503 service unavailable" in text_lower or "504 gateway time-out" in text_lower:
+            # Network disconnection & offline signatures
+            network_errors = [
+                "no internet",
+                "this site can’t be reached",
+                "this site cannot be reached",
+                "err_internet_disconnected",
+                "err_connection_reset",
+                "err_name_not_resolved",
+                "err_connection_timed_out",
+                "err_connection_refused",
+                "err_network_changed",
+                "err_empty_response",
+                "dns_probe_finished_no_internet",
+                "check your internet connection",
+                "check your network",
+            ]
+            for err in network_errors:
+                if err in text_lower:
+                    return True
+
+            # Server error signatures
+            server_errors = [
+                "internal server error",
+                "502 bad gateway",
+                "503 service unavailable",
+                "504 gateway time-out",
+                "504 gateway timeout",
+                "something went wrong",
+                "we're sorry",
+            ]
+            for err in server_errors:
+                if err in text_lower:
+                    return True
+
+            if "500" in body_text and ("something went wrong" in text_lower or "we're sorry" in text_lower or "go to home" in text_lower or "error" in text_lower):
                 return True
         except Exception:
             pass
         return False
 
-    async def _recover_from_500_error(self, target_url: str = CRYPTO_BOX_URL, max_retries: int = 4) -> bool:
+    async def _is_500_error_page(self) -> bool:
+        """Backward compatibility alias for _is_error_page."""
+        return await self._is_error_page()
+
+    async def _recover_from_error(self, target_url: str = CRYPTO_BOX_URL, max_retries: int = 4) -> bool:
         """
-        If a 500 error page is detected, automatically refreshes and re-navigates
-        until the page loads cleanly or max_retries is reached.
+        If a 500 or network error page is detected, automatically refreshes and re-navigates
+        with progressive backoff until the page loads cleanly or max_retries is reached.
         """
-        if not await self._is_500_error_page():
+        if not await self._is_error_page():
             return True
 
         for attempt in range(1, max_retries + 1):
-            console.print(f"[bold yellow][!] Binance 500 Error detected! Auto-recovering session (Attempt {attempt}/{max_retries})...[/bold yellow]")
-            await asyncio.sleep(1.5 * attempt)
+            console.print(f"[bold yellow][!] Binance Network/Server Error detected! Auto-recovering session (Attempt {attempt}/{max_retries})...[/bold yellow]")
+            await asyncio.sleep(2.0 * attempt)
             try:
-                response = await self.page.goto(target_url, wait_until="domcontentloaded", timeout=15000)
+                response = await self.page.goto(target_url, wait_until="domcontentloaded", timeout=25000)
                 await asyncio.sleep(1.5)
                 
                 if response and response.status >= 500:
                     continue
 
-                if not await self._is_500_error_page():
-                    console.print(f"[bold green][✓] Successfully recovered from Binance 500 error page![/bold green]")
+                if not await self._is_error_page():
+                    console.print(f"[bold green][✓] Successfully recovered from error page![/bold green]")
                     return True
             except Exception as e:
                 console.print(f"[dim yellow][!] Recovery attempt {attempt} notice: {e}[/dim yellow]")
 
-        is_still_error = await self._is_500_error_page()
+        is_still_error = await self._is_error_page()
         if is_still_error:
-            console.print("[bold red][!] Could not clear Binance 500 error screen after multiple retries.[/bold red]")
+            console.print("[bold red][!] Could not clear Binance error screen after multiple retries. Waiting for connection...[/bold red]")
         return not is_still_error
+
+    async def _recover_from_500_error(self, target_url: str = CRYPTO_BOX_URL, max_retries: int = 4) -> bool:
+        """Backward compatibility alias for _recover_from_error."""
+        return await self._recover_from_error(target_url, max_retries)
 
     async def _dismiss_modals(self):
         """
@@ -364,8 +415,8 @@ class BinanceRedeemer:
                 raise e
 
         self.page = await self.context.new_page()
-        # Set default action timeout to 6 seconds instead of 30 seconds to never freeze
-        self.page.set_default_timeout(6000)
+        # Set default action timeout to 10 seconds to give unstable/laggy connections enough buffer
+        self.page.set_default_timeout(10000)
         console.print("[bold green][✓] Persistent browser session ready![/bold green]")
 
     async def check_login_status(self):
@@ -408,8 +459,8 @@ class BinanceRedeemer:
 
     async def _find_crypto_box_input(self):
         """Attempts to find the Crypto Box code input field with tab check."""
-        if await self._is_500_error_page():
-            await self._recover_from_500_error(CRYPTO_BOX_URL)
+        if await self._is_error_page():
+            await self._recover_from_error(CRYPTO_BOX_URL)
 
         input_selectors = [
             'input[placeholder*="Red Packet" i]',
@@ -417,6 +468,7 @@ class BinanceRedeemer:
             'input[placeholder*="code" i]',
             'input[placeholder*="Box" i]',
             'input[name="code"]',
+            'main input[type="text"]',
             'input[type="text"]'
         ]
 
@@ -438,8 +490,8 @@ class BinanceRedeemer:
 
         for sel in input_selectors:
             try:
-                el = await self.page.wait_for_selector(sel, state="visible", timeout=2000)
-                if el:
+                el = await self.page.wait_for_selector(sel, state="visible", timeout=3500)
+                if el and await el.is_visible():
                     return el
             except Exception:
                 continue
@@ -450,7 +502,7 @@ class BinanceRedeemer:
         """
         Examines inline form error messages, dialogs, modals, toasts, and DOM text
         to accurately classify the result of a redemption attempt.
-        Only inspects VISIBLE elements to prevent false positives from stale DOM nodes.
+        Filters out page chrome, headers, footers, and language/currency noise (e.g. 'English English USD-$').
         """
         if not self.page:
             return {"status": "no_page", "message": "No active browser page"}
@@ -467,23 +519,42 @@ class BinanceRedeemer:
                            (el.offsetWidth > 0 || el.offsetHeight > 0 || el.getClientRects().length > 0);
                 };
 
-                // 1. Check known feedback / form error selector containers
+                const isInsideHeaderOrNav = (el) => {
+                    let cur = el;
+                    while (cur && cur !== document.body) {
+                        const tag = (cur.tagName || '').toLowerCase();
+                        const cls = (cur.className || '').toString().toLowerCase();
+                        const role = (cur.getAttribute('role') || '').toLowerCase();
+                        if (tag === 'header' || tag === 'nav' || tag === 'footer' || 
+                            cls.includes('header') || cls.includes('navbar') || cls.includes('footer') ||
+                            role === 'navigation') {
+                            return true;
+                        }
+                        cur = cur.parentElement;
+                    }
+                    return false;
+                };
+
+                const IGNORED_WORDS = ['english', 'usd', 'theme', 'dark', 'light', 'download', 'app', 'cookie', 'preferences', 'terms', 'privacy'];
+                const isNoise = (str) => {
+                    if (!str || str.length < 2) return true;
+                    const words = str.toLowerCase().replace(/[^a-z0-9 ]/g, ' ').split(/\\s+/).filter(Boolean);
+                    if (words.length === 0) return true;
+                    return words.every(w => IGNORED_WORDS.includes(w) || !isNaN(w));
+                };
+
+                // 1. Check known feedback / form error selector containers (excluding header/nav/footer)
                 const selectors = [
                     '.bn-form-item-explain',
                     '.bn-form-item-error',
                     '.bn-feedback',
                     '.toast',
                     '.bn-toast',
-                    '.bn-modal',
                     '.openbox',
+                    '.bn-modal',
                     '[role="alert"]',
-                    '[role="dialog"]',
                     'div[class*="error" i]',
                     'div[class*="feedback" i]',
-                    'div[class*="tip" i]',
-                    'div[class*="notice" i]',
-                    'div[class*="message" i]',
-                    'div[class*="warning" i]',
                     'div[class*="Toast" i]'
                 ];
 
@@ -491,8 +562,11 @@ class BinanceRedeemer:
                     try {
                         const elements = document.querySelectorAll(sel);
                         elements.forEach(el => {
-                            if (isVisible(el) && el.innerText && el.innerText.trim()) {
-                                texts.push(el.innerText.trim());
+                            if (isVisible(el) && !isInsideHeaderOrNav(el) && el.innerText && el.innerText.trim()) {
+                                const clean = el.innerText.trim();
+                                if (!isNoise(clean)) {
+                                    texts.push(clean);
+                                }
                             }
                         });
                     } catch (e) {}
@@ -503,7 +577,7 @@ class BinanceRedeemer:
                 if (input) {
                     let parent = input.parentElement;
                     for (let i = 0; i < 5 && parent; i++) {
-                        if (isVisible(parent)) {
+                        if (isVisible(parent) && !isInsideHeaderOrNav(parent)) {
                             const pText = (parent.innerText || '').trim();
                             if (pText && (
                                 pText.includes('exceeded') || 
@@ -514,7 +588,9 @@ class BinanceRedeemer:
                                 pText.includes('claimed') || 
                                 pText.includes('exist')
                             )) {
-                                texts.push(pText);
+                                if (!isNoise(pText)) {
+                                    texts.push(pText);
+                                }
                             }
                         }
                         parent = parent.parentElement;
@@ -524,6 +600,15 @@ class BinanceRedeemer:
                 return texts.join('\\n');
             }""")
         except Exception:
+            raw_feedback = ""
+
+        if not isinstance(raw_feedback, str):
+            raw_feedback = str(raw_feedback or "")
+
+        # Filter out noise in Python as second-level defense
+        lower_words = re.findall(r'[a-zA-Z]+', raw_feedback.lower())
+        noise_dict = {"english", "usd", "theme", "dark", "light", "download", "app", "cookie", "preferences", "terms", "privacy", "copyright"}
+        if lower_words and all(w in noise_dict for w in lower_words):
             raw_feedback = ""
 
         text_lower = raw_feedback.lower()
@@ -609,7 +694,7 @@ class BinanceRedeemer:
                 "message": "Binance server error"
             }
 
-        # 6. Unrecognized / Unknown text
+        # 6. Unrecognized / Unknown text (only if meaningful)
         if raw_feedback.strip():
             clean_snippet = raw_feedback.replace('\n', ' ').strip()
             return {
@@ -622,11 +707,88 @@ class BinanceRedeemer:
             "message": "No response text detected"
         }
 
+    async def _wait_for_claim_outcome(self, code: str, timeout_seconds: float = 12.0) -> Dict[str, Any]:
+        """
+        Intelligently awaits the outcome of clicking 'Claim' over unstable/slow internet.
+        Polls actively up to timeout_seconds:
+        1. Checks for 'Open' button (packet ready to open).
+        2. Checks for genuine Binance feedback (expired, claimed, invalid, rate limited).
+        3. Checks for 500 error / offline page.
+        4. Detects in-flight / loading spinner states and continues waiting.
+        """
+        start_time = time.time()
+        open_selectors = [
+            'button:has-text("Open")',
+            '.openbox button:has-text("Open")',
+            '.openbox div[role="button"]:has-text("Open")',
+            'div[role="button"]:has-text("Open")',
+            '.openbox button',
+        ]
+
+        while time.time() - start_time < timeout_seconds:
+            # 1. Check if an error screen appeared
+            if await self._is_error_page():
+                return {"status": "server_error", "message": "Binance Error Screen detected"}
+
+            # 2. Check for "Open" modal button (valid un-claimed packet)
+            for o_sel in open_selectors:
+                try:
+                    open_btn = await self.page.query_selector(o_sel)
+                    if open_btn and await open_btn.is_visible():
+                        try:
+                            await open_btn.click(timeout=2500)
+                        except Exception:
+                            await open_btn.click(timeout=2000, force=True)
+                        await self._human_delay(1.2, 2.0)
+                        console.print(f"[bold gold1]🎉 [SUCCESS] Successfully opened Red Packet '{code}'![/bold gold1]")
+                        return {"status": "success", "message": "Red Packet opened"}
+                except Exception:
+                    pass
+
+            # 3. Check for genuine Crypto Box feedback
+            fb = await self._extract_page_feedback()
+            status = fb.get("status", "unknown")
+
+            if status in ["rate_limited", "expired", "already_claimed", "invalid", "server_error"]:
+                return fb
+
+            # 4. Check if claim button is still in a loading / spinning / disabled state
+            is_loading = False
+            try:
+                is_loading = await self.page.evaluate("""() => {
+                    const claimBtn = document.querySelector('button[type="submit"]') ||
+                                     Array.from(document.querySelectorAll('button')).find(b => (b.innerText || '').includes('Claim'));
+                    if (!claimBtn) return false;
+                    const hasSpin = claimBtn.querySelector('svg, .bn-loading, [class*="spin" i], [class*="loading" i]');
+                    const isDisabled = claimBtn.disabled || claimBtn.getAttribute('aria-disabled') === 'true' || claimBtn.classList.contains('is-loading');
+                    return !!(hasSpin || isDisabled);
+                }""")
+            except Exception:
+                pass
+
+            if is_loading:
+                # Request is still traveling across slow internet, keep waiting
+                await asyncio.sleep(0.35)
+                continue
+
+            # 5. If feedback is unknown with text, give it a moment to stabilize
+            if status == "unknown" and fb.get("message") and (time.time() - start_time >= 3.0):
+                return fb
+
+            await asyncio.sleep(0.35)
+
+        # Timeout reached with no conclusive result
+        return {
+            "status": "network_timeout",
+            "message": f"Binance response timed out after {int(timeout_seconds)}s (poor/unstable internet)"
+        }
+
     async def claim_crypto_box_code(self, code: str, max_attempts: int = 3) -> Dict[str, Any]:
         """
         Navigates to Binance Crypto Box page and claims the 8-character code.
         Guaranteed single-threaded execution using asyncio.Lock to prevent typing collisions.
-        Includes full rate-limit lockout detection, circuit breaker, and automatic 500 error recovery.
+        Includes full rate-limit lockout detection, circuit breaker, and automatic network/500 recovery.
+        Avoids redundant page reloads to operate reliably over poor and high-latency internet.
         """
         async with self._lock:
             # Check lockout before making any browser calls
@@ -650,79 +812,69 @@ class BinanceRedeemer:
                     if attempt > 1:
                         console.print(f"[bold cyan]🔄 Retrying code '{code}' (Attempt {attempt}/{max_attempts})...[/bold cyan]")
 
-                    # 1. Check & Recover from any existing 500 Error
-                    if await self._is_500_error_page():
-                        recovered = await self._recover_from_500_error(CRYPTO_BOX_URL)
+                    # 1. Check & Recover from any existing Error page
+                    if await self._is_error_page():
+                        recovered = await self._recover_from_error(CRYPTO_BOX_URL)
                         if not recovered:
                             result["status"] = "server_error"
-                            result["message"] = "Binance 500 Server Error"
+                            result["message"] = "Binance Network/Server Error"
                             if attempt < max_attempts:
                                 await asyncio.sleep(2.0)
                                 continue
-                            else:
-                                return result
+                            return result
 
                     console.print(f"[bold magenta][➔] Opening Crypto Box page to claim code: [bold yellow]{code}[/bold yellow]...[/bold magenta]")
                     
                     # Dismiss any lingering popups from previous codes
                     await self._dismiss_modals()
 
-                    # If not on target page or if an unclosable modal was lingering, reload cleanly
-                    needs_reload = False
-                    if CRYPTO_BOX_URL not in self.page.url:
-                        res = await self.page.goto(CRYPTO_BOX_URL, wait_until="domcontentloaded", timeout=12000)
-                        if res and res.status >= 500:
-                            needs_reload = True
-                        await self._human_delay(1.0, 1.8)
-                    else:
-                        lingering = await self.page.query_selector('.openbox, .bn-mask')
-                        if lingering:
-                            needs_reload = True
+                    # Optimize page navigation: if already on CRYPTO_BOX_URL and input field is ready, DO NOT reload!
+                    input_field = None
+                    is_err = await self._is_error_page()
 
-                    if needs_reload or await self._is_500_error_page():
-                        await self._recover_from_500_error(CRYPTO_BOX_URL)
+                    if not is_err and self.page and CRYPTO_BOX_URL in self.page.url:
+                        input_field = await self._find_crypto_box_input()
 
-                    # Locate input field
-                    input_field = await self._find_crypto_box_input()
-
-                    # If still not found, do a quick clean reload or 500 recovery
-                    if not input_field:
-                        if await self._is_500_error_page():
-                            await self._recover_from_500_error(CRYPTO_BOX_URL)
-                            input_field = await self._find_crypto_box_input()
+                    if not input_field or is_err:
+                        if is_err:
+                            await self._recover_from_error(CRYPTO_BOX_URL)
                         else:
-                            console.print("[dim yellow][i] Refreshing page to load Crypto Box form...[/dim yellow]")
-                            await self.page.goto(CRYPTO_BOX_URL, wait_until="domcontentloaded", timeout=12000)
-                            await self._human_delay(1.2, 2.0)
+                            try:
+                                await self.page.goto(CRYPTO_BOX_URL, wait_until="domcontentloaded", timeout=25000)
+                                await self._human_delay(0.8, 1.5)
+                            except Exception as e:
+                                console.print(f"[dim yellow][!] Navigation notice ({e}), attempting error recovery...[/dim yellow]")
+                                await self._recover_from_error(CRYPTO_BOX_URL)
+
+                        input_field = await self._find_crypto_box_input()
+
+                    if not input_field:
+                        if await self._is_error_page():
+                            await self._recover_from_error(CRYPTO_BOX_URL)
                             input_field = await self._find_crypto_box_input()
 
                     if not input_field:
-                        if await self._is_500_error_page():
-                            result["status"] = "server_error"
-                            result["message"] = "Binance 500 Server Error"
-                        else:
-                            console.print("[bold red][!] Code input field not found on page.[/bold red]")
-                            result["message"] = "Input field not found"
-
+                        console.print("[bold red][!] Code input field not found on page.[/bold red]")
+                        result["status"] = "input_not_found"
+                        result["message"] = "Input field not found"
                         if attempt < max_attempts:
                             await asyncio.sleep(2.0)
                             continue
-
                         await self._dismiss_modals()
                         return result
 
                     # Click & enter code (use force=True fallback if anything attempts to intercept)
                     try:
-                        await input_field.click(timeout=2500)
+                        await input_field.click(timeout=3000)
                     except Exception:
                         await self._dismiss_modals()
-                        await input_field.click(timeout=2000, force=True)
+                        await input_field.click(timeout=2500, force=True)
 
                     await self._human_delay(0.2, 0.4)
                     await self._human_type(input_field, code)
-                    await self._human_delay(0.3, 0.6)
+                    await self._human_delay(0.2, 0.4)
 
-                    # Find & click Claim button
+                    # Find & click Claim button (with generous timeout for slow JS hydration)
                     claim_selectors = [
                         'button:has-text("Claim Now")',
                         'button:has-text("Claim")',
@@ -734,19 +886,20 @@ class BinanceRedeemer:
                     claim_btn = None
                     for c_sel in claim_selectors:
                         try:
-                            btn = await self.page.wait_for_selector(c_sel, state="visible", timeout=1500)
-                            if btn:
+                            btn = await self.page.wait_for_selector(c_sel, state="visible", timeout=3500)
+                            if btn and await btn.is_visible():
                                 claim_btn = btn
                                 break
                         except Exception:
                             continue
 
                     if not claim_btn:
-                        if await self._is_500_error_page():
+                        if await self._is_error_page():
                             result["status"] = "server_error"
-                            result["message"] = "Binance 500 Server Error"
+                            result["message"] = "Binance Error on page"
                         else:
                             console.print("[bold red][!] Claim button not found on page.[/bold red]")
+                            result["status"] = "button_not_found"
                             result["message"] = "Claim button not found"
 
                         if attempt < max_attempts:
@@ -757,128 +910,120 @@ class BinanceRedeemer:
                         return result
 
                     try:
-                        await claim_btn.click(timeout=2500)
+                        await claim_btn.click(timeout=3000)
                     except Exception:
-                        await claim_btn.click(timeout=2000, force=True)
+                        await claim_btn.click(timeout=2500, force=True)
 
                     console.print(f"[bold green][✓] Clicked Claim for code '{code}'. Awaiting response...[/bold green]")
-                    await self._human_delay(1.5, 2.5)
 
-                    # Check if clicking Claim triggered a 500 Error page
-                    if await self._is_500_error_page():
-                        console.print(f"[bold yellow][!] Claiming code '{code}' triggered a 500 error page! Recovering...[/bold yellow]")
-                        await self._recover_from_500_error(CRYPTO_BOX_URL)
-                        result["status"] = "server_error"
-                        result["message"] = "Binance 500 Server Error on submission"
-                        if attempt < max_attempts:
-                            await asyncio.sleep(2.0)
-                            continue
+                    # Intelligent outcome awaiter designed for bad internet
+                    outcome = await self._wait_for_claim_outcome(code, timeout_seconds=12.0)
+                    status = outcome.get("status", "unknown")
+                    fb_msg = outcome.get("message", "")
+
+                    if status == "success":
+                        result["status"] = "success"
+                        result["message"] = "Red Packet opened"
+                        self.clear_lockout()
+                        self._reset_circuit_breaker()
+                        await self._dismiss_modals()
+                        await self._human_delay(1.5, 3.0)
                         return result
 
-                    # 1. Check for "Open" modal button (valid un-claimed packet)
-                    open_selectors = [
-                        'button:has-text("Open")',
-                        '.openbox button:has-text("Open")',
-                        '.openbox div[role="button"]:has-text("Open")',
-                        'div[role="button"]:has-text("Open")'
-                    ]
-                    opened = False
-                    for o_sel in open_selectors:
-                        try:
-                            open_btn = await self.page.wait_for_selector(o_sel, state="visible", timeout=2000)
-                            if open_btn:
-                                try:
-                                    await open_btn.click(timeout=2000)
-                                except Exception:
-                                    await open_btn.click(timeout=1500, force=True)
-                                await self._human_delay(1.2, 2.0)
-                                console.print(f"[bold gold1]🎉 [SUCCESS] Successfully opened Red Packet '{code}'![/bold gold1]")
-                                result["status"] = "success"
-                                result["message"] = "Red Packet opened"
-                                self.clear_lockout()
-                                self._reset_circuit_breaker()
-                                opened = True
-                                break
-                        except Exception:
-                            pass
+                    elif status == "rate_limited":
+                        duration = outcome.get("retry_after") or parse_lockout_duration(fb_msg)
+                        self.set_lockout(duration, fb_msg)
+                        rem_str = self.get_lockout_remaining_str()
+                        console.print(f"[bold red]🚫 BINANCE RATE LIMIT DETECTED: {fb_msg}[/bold red]")
+                        console.print(f"[bold red]⏳ Auto-claimer is paused. Cooldown expires in: {rem_str}[/bold red]")
+                        result["status"] = "rate_limited"
+                        result["message"] = fb_msg
+                        result["retry_after"] = duration
+                        await self._dismiss_modals()
+                        return result
 
-                    if not opened:
-                        # 2. Check for feedback (Rate limit / Expired / Already Claimed / Invalid)
-                        fb = await self._extract_page_feedback()
-                        status = fb.get("status", "unknown")
-                        fb_msg = fb.get("message", "")
+                    elif status == "expired":
+                        self.clear_lockout()
+                        console.print(f"[yellow][i] Code '{code}' is EXPIRED or fully claimed by others.[/yellow]")
+                        result["status"] = "expired"
+                        result["message"] = "Expired or fully claimed"
+                        await self._handle_circuit_breaker()
+                        await self._dismiss_modals()
+                        return result
 
-                        if status == "rate_limited":
-                            duration = fb.get("retry_after") or parse_lockout_duration(fb_msg)
-                            self.set_lockout(duration, fb_msg)
-                            rem_str = self.get_lockout_remaining_str()
-                            console.print(f"[bold red]🚫 BINANCE RATE LIMIT DETECTED: {fb_msg}[/bold red]")
-                            console.print(f"[bold red]⏳ Auto-claimer is paused. Cooldown expires in: {rem_str}[/bold red]")
-                            result["status"] = "rate_limited"
-                            result["message"] = fb_msg
-                            result["retry_after"] = duration
+                    elif status == "already_claimed":
+                        self.clear_lockout()
+                        console.print(f"[yellow][i] You have already claimed code '{code}'.[/yellow]")
+                        result["status"] = "already_claimed"
+                        result["message"] = "Already claimed"
+                        await self._dismiss_modals()
+                        await self._human_delay(1.0, 2.0)
+                        return result
+
+                    elif status == "invalid":
+                        self.clear_lockout()
+                        console.print(f"[red][!] Code '{code}' is invalid.[/red]")
+                        result["status"] = "invalid"
+                        result["message"] = "Invalid code"
+                        await self._handle_circuit_breaker()
+                        await self._dismiss_modals()
+                        return result
+
+                    elif status == "server_error":
+                        console.print(f"[bold yellow][!] Server/Network error response for code '{code}'.[/bold yellow]")
+                        result["status"] = "server_error"
+                        result["message"] = fb_msg
+                        if await self._is_error_page():
+                            await self._recover_from_error(CRYPTO_BOX_URL)
+                        if attempt < max_attempts:
+                            console.print(f"[bold cyan]🔄 Retrying code '{code}' after error recovery (Attempt {attempt + 1}/{max_attempts})...[/bold cyan]")
+                            await asyncio.sleep(2.0)
+                            continue
+                        await self._dismiss_modals()
+                        return result
+
+                    elif status == "network_timeout":
+                        console.print(f"[bold yellow][!] Network timeout waiting for response on code '{code}' (poor internet).[/bold yellow]")
+                        result["status"] = "network_timeout"
+                        result["message"] = fb_msg
+                        if await self._is_error_page():
+                            await self._recover_from_error(CRYPTO_BOX_URL)
+                        if attempt < max_attempts:
+                            console.print(f"[bold cyan]🔄 Retrying code '{code}' (Attempt {attempt + 1}/{max_attempts})...[/bold cyan]")
+                            await asyncio.sleep(2.0)
+                            continue
+                        await self._dismiss_modals()
+                        return result
+
+                    else:
+                        console.print(f"[bold dim][i] Code '{code}' response: {fb_msg if fb_msg else 'No clear response'}.[/bold dim]")
+                        result["status"] = "unknown"
+                        result["message"] = fb_msg or "Unknown response"
+                        if attempt < max_attempts:
+                            console.print(f"[bold cyan]🔄 Retrying code '{code}' (Attempt {attempt + 1}/{max_attempts})...[/bold cyan]")
                             await self._dismiss_modals()
-                            return result
-
-                        elif status == "expired":
-                            self.clear_lockout()
-                            console.print(f"[yellow][i] Code '{code}' is EXPIRED or fully claimed by others.[/yellow]")
-                            result["status"] = "expired"
-                            result["message"] = "Expired or fully claimed"
-                            await self._handle_circuit_breaker()
-
-                        elif status == "already_claimed":
-                            self.clear_lockout()
-                            console.print(f"[yellow][i] You have already claimed code '{code}'.[/yellow]")
-                            result["status"] = "already_claimed"
-                            result["message"] = "Already claimed"
-                            await self._human_delay(1.0, 2.0)
-
-                        elif status == "invalid":
-                            self.clear_lockout()
-                            console.print(f"[red][!] Code '{code}' is invalid.[/red]")
-                            result["status"] = "invalid"
-                            result["message"] = "Invalid code"
-                            await self._handle_circuit_breaker()
-
-                        elif status == "server_error":
-                            console.print(f"[bold yellow][!] Server error response for code '{code}'.[/bold yellow]")
-                            result["status"] = "server_error"
-                            result["message"] = fb_msg
-
-                        else:
-                            console.print(f"[bold dim][i] Code '{code}' response: {fb_msg if fb_msg else 'Done'}.[/bold dim]")
-                            result["status"] = "unknown"
-                            result["message"] = fb_msg or "Done"
-
-                    # Dismiss popup dialogs immediately so the next code has a clean canvas
-                    await self._dismiss_modals()
-
-                    # Ensure page is NOT left on a 500 error screen
-                    if await self._is_500_error_page():
-                        await self._recover_from_500_error(CRYPTO_BOX_URL)
-
-                    # Natural stealth pause before next code
-                    if result["status"] == "success":
-                        await self._human_delay(1.5, 3.0)
-                    return result
+                            await asyncio.sleep(2.0)
+                            continue
+                        await self._dismiss_modals()
+                        return result
 
                 except Exception as e:
                     console.print(f"[bold red][!] Error while claiming code {code} (Attempt {attempt}/{max_attempts}): {e}[/bold red]")
                     result["message"] = str(e)
-                    if await self._is_500_error_page():
+                    if await self._is_error_page():
                         result["status"] = "server_error"
-                        await self._recover_from_500_error(CRYPTO_BOX_URL)
+                        await self._recover_from_error(CRYPTO_BOX_URL)
 
                     await self._dismiss_modals()
                     if attempt < max_attempts:
                         await asyncio.sleep(2.0)
+                        continue
                     else:
                         return result
 
             # Final cleanup check
-            if await self._is_500_error_page():
-                await self._recover_from_500_error(CRYPTO_BOX_URL)
+            if await self._is_error_page():
+                await self._recover_from_error(CRYPTO_BOX_URL)
 
             return result
 
@@ -910,22 +1055,22 @@ class BinanceRedeemer:
                     if attempt > 1:
                         console.print(f"[bold cyan]🔄 Retrying Square post '{post_url}' (Attempt {attempt}/{max_attempts})...[/bold cyan]")
 
-                    if await self._is_500_error_page():
-                        await self._recover_from_500_error(post_url)
+                    if await self._is_error_page():
+                        await self._recover_from_error(post_url)
 
                     console.print(f"[bold magenta][➔] Opening Binance Square Post: {post_url}[/bold magenta]")
                     console.print(f"[bold gold1]🔑 Submitting Answer: '{answer}'[/bold gold1]")
 
                     await self._dismiss_modals()
-                    response = await self.page.goto(post_url, wait_until="domcontentloaded", timeout=20000)
+                    response = await self.page.goto(post_url, wait_until="domcontentloaded", timeout=25000)
                     await self._human_delay(2.0, 3.5)
 
-                    if (response and response.status >= 500) or await self._is_500_error_page():
-                        console.print("[yellow][!] 500 Error encountered loading Binance Square post. Recovering...[/yellow]")
-                        recovered = await self._recover_from_500_error(post_url)
+                    if (response and response.status >= 500) or await self._is_error_page():
+                        console.print("[yellow][!] Error encountered loading Binance Square post. Recovering...[/yellow]")
+                        recovered = await self._recover_from_error(post_url)
                         if not recovered:
                             result["status"] = "server_error"
-                            result["message"] = "Binance 500 Server Error"
+                            result["message"] = "Binance Network/Server Error"
                             if attempt < max_attempts:
                                 await asyncio.sleep(2.0)
                                 continue
@@ -945,7 +1090,7 @@ class BinanceRedeemer:
                     input_field = None
                     for sel in input_selectors:
                         try:
-                            el = await self.page.wait_for_selector(sel, state="visible", timeout=3000)
+                            el = await self.page.wait_for_selector(sel, state="visible", timeout=3500)
                             if el:
                                 input_field = el
                                 break
@@ -962,9 +1107,9 @@ class BinanceRedeemer:
                         return result
 
                     try:
-                        await input_field.click(timeout=2500)
+                        await input_field.click(timeout=3000)
                     except Exception:
-                        await input_field.click(timeout=2000, force=True)
+                        await input_field.click(timeout=2500, force=True)
 
                     await self._human_delay(0.3, 0.6)
 
@@ -988,7 +1133,7 @@ class BinanceRedeemer:
                     submit_btn = None
                     for s_sel in submit_selectors:
                         try:
-                            btn = await self.page.wait_for_selector(s_sel, state="visible", timeout=2500)
+                            btn = await self.page.wait_for_selector(s_sel, state="visible", timeout=3500)
                             if btn:
                                 submit_btn = btn
                                 break
@@ -997,27 +1142,27 @@ class BinanceRedeemer:
 
                     if submit_btn:
                         try:
-                            await submit_btn.click(timeout=2500)
+                            await submit_btn.click(timeout=3000)
                         except Exception:
-                            await submit_btn.click(timeout=2000, force=True)
+                            await submit_btn.click(timeout=2500, force=True)
 
                         console.print(f"[bold green][✓] Answer '{answer}' submitted to post.[/bold green]")
                         await self._human_delay(1.5, 2.5)
 
-                        if await self._is_500_error_page():
-                            console.print("[yellow][!] 500 Error after submitting answer. Recovering...[/yellow]")
-                            await self._recover_from_500_error(post_url)
+                        if await self._is_error_page():
+                            console.print("[yellow][!] Error after submitting answer. Recovering...[/yellow]")
+                            await self._recover_from_error(post_url)
                             result["status"] = "server_error"
-                            result["message"] = "Binance 500 Server Error"
+                            result["message"] = "Binance Network/Server Error"
                             if attempt < max_attempts:
                                 await asyncio.sleep(2.0)
                                 continue
                             return result
 
                         try:
-                            open_btn = await self.page.wait_for_selector('button:has-text("Open"), div[role="button"]:has-text("Open")', state="visible", timeout=3000)
+                            open_btn = await self.page.wait_for_selector('button:has-text("Open"), div[role="button"]:has-text("Open")', state="visible", timeout=3500)
                             if open_btn:
-                                await open_btn.click(timeout=2000, force=True)
+                                await open_btn.click(timeout=2500, force=True)
                                 console.print(f"[bold gold1]🎉 [SUCCESS] Red Packet Opened for post {post_url}![/bold gold1]")
                                 result["status"] = "success"
                                 result["message"] = "Red Packet opened"
@@ -1043,12 +1188,13 @@ class BinanceRedeemer:
                 except Exception as e:
                     console.print(f"[bold red][!] Error on Binance Square post (Attempt {attempt}/{max_attempts}): {e}[/bold red]")
                     result["message"] = str(e)
-                    if await self._is_500_error_page():
+                    if await self._is_error_page():
                         result["status"] = "server_error"
-                        await self._recover_from_500_error(post_url)
+                        await self._recover_from_error(post_url)
                     await self._dismiss_modals()
                     if attempt < max_attempts:
                         await asyncio.sleep(2.0)
+                        continue
                     else:
                         return result
 
@@ -1073,17 +1219,17 @@ class BinanceRedeemer:
             result = {"url": url, "status": "failed", "message": ""}
             for attempt in range(1, max_attempts + 1):
                 try:
-                    if await self._is_500_error_page():
-                        await self._recover_from_500_error(url)
+                    if await self._is_error_page():
+                        await self._recover_from_error(url)
 
                     console.print(f"[bold magenta][➔] Opening Direct Red Packet Link: {url}[/bold magenta]")
                     await self._dismiss_modals()
-                    response = await self.page.goto(url, wait_until="domcontentloaded", timeout=15000)
+                    response = await self.page.goto(url, wait_until="domcontentloaded", timeout=25000)
                     await self._human_delay(1.5, 2.5)
 
-                    if (response and response.status >= 500) or await self._is_500_error_page():
-                        console.print("[yellow][!] 500 Error loading Red Packet link. Recovering...[/yellow]")
-                        await self._recover_from_500_error(url)
+                    if (response and response.status >= 500) or await self._is_error_page():
+                        console.print("[yellow][!] Error loading Red Packet link. Recovering...[/yellow]")
+                        await self._recover_from_error(url)
                         result["status"] = "server_error"
                         if attempt < max_attempts:
                             await asyncio.sleep(2.0)
@@ -1091,9 +1237,9 @@ class BinanceRedeemer:
                         return result
 
                     try:
-                        open_btn = await self.page.wait_for_selector('button:has-text("Open"), button:has-text("Claim"), div[role="button"]:has-text("Open")', state="visible", timeout=3000)
+                        open_btn = await self.page.wait_for_selector('button:has-text("Open"), button:has-text("Claim"), div[role="button"]:has-text("Open")', state="visible", timeout=3500)
                         if open_btn:
-                            await open_btn.click(timeout=2000, force=True)
+                            await open_btn.click(timeout=2500, force=True)
                             console.print(f"[bold gold1]🎉 [SUCCESS] Clicked Open on Red Packet link![/bold gold1]")
                             result["status"] = "success"
                             self.clear_lockout()
@@ -1112,6 +1258,7 @@ class BinanceRedeemer:
                     result["message"] = str(e)
                     if attempt < max_attempts:
                         await asyncio.sleep(2.0)
+                        continue
                     else:
                         return result
 

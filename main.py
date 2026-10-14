@@ -64,8 +64,8 @@ HELD_DROPS_FILE = os.path.abspath("./held_drops.json")
 MAX_FRESH_CODE_AGE_SECONDS = 180  # Codes older than 3 minutes are dead in public channels
 
 # Stepped reconnection backoff schedule for internet disconnections / Telegram unreachability
-# Ladder: 30s -> 1m -> 3m -> 5m -> 10m -> 20m -> 30m -> 45m
-RETRY_DELAYS = [30, 60, 180, 300, 600, 1200, 1800, 2700]
+# Ladder: 5s -> 10s -> 20s -> 30s -> 1m -> 3m -> 5m -> 10m -> 20m -> 30m
+RETRY_DELAYS = [5, 10, 20, 30, 60, 180, 300, 600, 1200, 1800]
 
 
 def get_backoff_delay(attempt: int) -> int:
@@ -171,8 +171,9 @@ client = TelegramClient(
     'binance_session',
     int(API_ID),
     API_HASH,
-    connection_retries=3,
-    retry_delay=1,
+    connection_retries=10,
+    retry_delay=2,
+    timeout=20,
     auto_reconnect=True
 )
 redeemer = BinanceRedeemer(headless=HEADLESS_MODE)
@@ -212,6 +213,11 @@ async def process_single_item(item_type: str, identifier: str, extra: str = "", 
                 border_style="red"
             ))
             enqueue_held_drop(item_type, identifier, extra, timestamp=ts)
+        elif status in ["server_error", "network_timeout"]:
+            console.print(f"[bold yellow][!] Code '{identifier}' hit {status} ({res.get('message')}). Not cached.[/bold yellow]")
+            if (time.time() - ts) < MAX_FRESH_CODE_AGE_SECONDS:
+                console.print(f"[bold cyan]📥 Code '{identifier}' is fresh (< 3m old). Enqueued in held drops to retry when internet stabilizes.[/bold cyan]")
+                enqueue_held_drop(item_type, identifier, extra, timestamp=ts)
         else:
             console.print(f"[bold yellow][!] Code '{identifier}' returned status '{status}' ({res.get('message')}). Not cached.[/bold yellow]")
 
@@ -228,6 +234,11 @@ async def process_single_item(item_type: str, identifier: str, extra: str = "", 
             rem_str = redeemer.get_lockout_remaining_str()
             console.print(f"[bold red]🚫 Lockout active ({rem_str} remaining). Square post '{identifier}' held in queue.[/bold red]")
             enqueue_held_drop(item_type, identifier, extra, timestamp=ts)
+        elif status in ["server_error", "network_timeout"]:
+            console.print(f"[bold yellow][!] Square post '{identifier}' hit {status}. Not cached.[/bold yellow]")
+            if (time.time() - ts) < MAX_FRESH_CODE_AGE_SECONDS:
+                console.print(f"[bold cyan]📥 Square post '{identifier}' is fresh. Enqueued in held drops to retry when internet stabilizes.[/bold cyan]")
+                enqueue_held_drop(item_type, identifier, extra, timestamp=ts)
         else:
             console.print(f"[bold yellow][!] Square post '{identifier}' returned '{status}'. Not cached.[/bold yellow]")
 
@@ -244,6 +255,11 @@ async def process_single_item(item_type: str, identifier: str, extra: str = "", 
             rem_str = redeemer.get_lockout_remaining_str()
             console.print(f"[bold red]🚫 Lockout active ({rem_str} remaining). Link '{identifier}' held in queue.[/bold red]")
             enqueue_held_drop(item_type, identifier, extra, timestamp=ts)
+        elif status in ["server_error", "network_timeout"]:
+            console.print(f"[bold yellow][!] Link '{identifier}' hit {status}. Not cached.[/bold yellow]")
+            if (time.time() - ts) < MAX_FRESH_CODE_AGE_SECONDS:
+                console.print(f"[bold cyan]📥 Link '{identifier}' is fresh. Enqueued in held drops to retry when internet stabilizes.[/bold cyan]")
+                enqueue_held_drop(item_type, identifier, extra, timestamp=ts)
         else:
             console.print(f"[bold yellow][!] Link '{identifier}' returned '{status}'. Not cached.[/bold yellow]")
 
@@ -419,21 +435,28 @@ async def live_message_handler(event):
 async def keepalive_watchdog():
     """
     Periodically checks MTProto connectivity to Telegram servers.
-    If the connection drops silently, disconnects client to trigger the stepped backoff ladder quickly.
+    Requires 3 consecutive ping timeouts before triggering reconnect,
+    preventing spurious disconnects during momentary network jitter.
     """
     from telethon.tl.functions import PingRequest
+    consecutive_timeouts = 0
     while True:
         try:
             await asyncio.sleep(25)
             if client.is_connected():
                 try:
-                    await asyncio.wait_for(client(PingRequest(ping_id=0)), timeout=10.0)
+                    await asyncio.wait_for(client(PingRequest(ping_id=0)), timeout=12.0)
+                    consecutive_timeouts = 0
                 except Exception as e:
-                    console.print(f"[dim yellow][!] Telegram keepalive ping timed out ({e}). Triggering reconnection ladder...[/dim yellow]")
-                    try:
-                        await client.disconnect()
-                    except Exception:
-                        pass
+                    consecutive_timeouts += 1
+                    console.print(f"[dim yellow][!] Telegram keepalive ping notice ({consecutive_timeouts}/3): {e}[/dim yellow]")
+                    if consecutive_timeouts >= 3:
+                        console.print("[bold yellow][!] 3 consecutive Telegram keepalive pings timed out. Triggering reconnection ladder...[/bold yellow]")
+                        consecutive_timeouts = 0
+                        try:
+                            await client.disconnect()
+                        except Exception:
+                            pass
         except asyncio.CancelledError:
             break
         except Exception:
@@ -515,7 +538,7 @@ async def connect_and_listen(catchup_limit: int = 35):
         delay = get_backoff_delay(attempt)
         delay_formatted = format_delay_text(delay)
         attempt_num = attempt + 1
-        ladder_summary = "30s → 1m → 3m → 5m → 10m → 20m → 30m → 45m"
+        ladder_summary = "5s → 10s → 20s → 30s → 1m → 3m → 5m → 10m → 20m → 30m"
 
         console.print(Panel(
             f"[bold red]🔌 TELEGRAM DISCONNECTED / UNREACHABLE[/bold red]\n"
@@ -648,7 +671,7 @@ async def main():
     table.add_row("Queued Held Drops", f"{len(held_drops)} item(s)")
     table.add_row("Lockout Status", lockout_status)
     table.add_row("Catch-Up Sweep Limit", f"{cli_args.catchup} recent drops")
-    table.add_row("Auto-Reconnect Ladder", "30s → 1m → 3m → 5m → 10m → 20m → 30m → 45m")
+    table.add_row("Auto-Reconnect Ladder", "5s → 10s → 20s → 30s → 1m → 3m → 5m → 10m → 20m → 30m")
     console.print(table)
 
     if is_locked:
