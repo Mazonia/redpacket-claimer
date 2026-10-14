@@ -339,7 +339,7 @@ class BinanceRedeemer:
             pass
 
     def _cleanup_stale_locks(self):
-        """Removes orphaned lock files and terminates lingering Chromium processes using USER_DATA_DIR."""
+        """Removes orphaned lock files and terminates ONLY lingering Chromium processes explicitly bound to OUR USER_DATA_DIR."""
         for lock_name in ["lockfile", "SingletonLock", "SingletonCookie", "SingletonSocket"]:
             lock_path = os.path.join(USER_DATA_DIR, lock_name)
             if os.path.exists(lock_path):
@@ -348,26 +348,37 @@ class BinanceRedeemer:
                 except Exception:
                     pass
 
-        if sys.platform == "win32":
-            try:
-                import subprocess
-                ps_script = """
-                Get-CimInstance Win32_Process | Where-Object { $_.Name -match 'chrome' -or $_.Name -match 'msedge' } | ForEach-Object {
-                    if ($_.CommandLine -and ($_.CommandLine -match 'user_data' -or $_.CommandLine -match 'ms-playwright')) {
-                        Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue
-                    }
-                }
-                """
-                subprocess.run(["powershell", "-NoProfile", "-Command", ps_script], capture_output=True, timeout=5)
-                for lock_name in ["lockfile", "SingletonLock", "SingletonCookie", "SingletonSocket"]:
-                    lock_path = os.path.join(USER_DATA_DIR, lock_name)
-                    if os.path.exists(lock_path):
+        # Strictly terminate ONLY processes that have our exact USER_DATA_DIR in their commandline.
+        # This guarantees zero interference with the user's personal Chrome/Edge, trading bots,
+        # or other Playwright instances running on the system.
+        target_dir = os.path.abspath(USER_DATA_DIR).lower()
+        try:
+            import psutil
+            for p in psutil.process_iter(['pid', 'name', 'cmdline']):
+                try:
+                    cmdline = p.info.get('cmdline') or []
+                    cmd_str = " ".join(cmdline).lower()
+                    if target_dir in cmd_str:
+                        p.terminate()
                         try:
-                            os.remove(lock_path)
+                            p.wait(timeout=1.0)
                         except Exception:
-                            pass
-            except Exception:
-                pass
+                            p.kill()
+                except (psutil.NoSuchProcess, psutil.AccessDenied):
+                    pass
+                except Exception:
+                    pass
+        except Exception:
+            pass
+
+        for lock_name in ["lockfile", "SingletonLock", "SingletonCookie", "SingletonSocket"]:
+            lock_path = os.path.join(USER_DATA_DIR, lock_name)
+            if os.path.exists(lock_path):
+                try:
+                    os.remove(lock_path)
+                except Exception:
+                    pass
+
 
     async def initialize(self):
         """Starts Playwright with persistent context so login session and cookies persist."""

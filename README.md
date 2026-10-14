@@ -32,6 +32,10 @@ A high-performance, automated Python application that monitors Telegram channels
 - **💾 Local Cache & Duplicate Prevention**:
   - Keeps a local `claimed_cache.json` to prevent re-submitting previously processed codes.
 
+- **🛡️ Strict Process Isolation & Non-Interference**:
+  - Browser lock cleanup strictly targets processes explicitly bound to this bot's local `./user_data/` directory.
+  - Never touches or terminates external Chrome/Edge browsers, user trading bots, or other Playwright sessions running on the machine.
+
 - **🔐 100% Private & Persistent Session**:
   - **Telegram Session**: Telethon runs locally on your machine. No tokens or messages are shared externally.
   - **Binance Session**: Uses Playwright's persistent Chromium browser context (`./user_data/`). Log into Binance **once** manually with 2FA; your session is preserved across runs.

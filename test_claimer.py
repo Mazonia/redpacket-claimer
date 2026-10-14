@@ -248,6 +248,62 @@ class TestMainNetworkManagement(unittest.TestCase):
         self.assertEqual(format_phone_number("+1234567890"), "+1234567890")
         self.assertEqual(format_phone_number(" +1 234-567-890 "), "+1234567890")
 
+class TestProcessIsolation(unittest.TestCase):
+    def test_cleanup_stale_locks_protects_other_processes(self):
+        """Verify _cleanup_stale_locks strictly isolates and never interferes with external browsers or trading bots."""
+        from redemption import BinanceRedeemer, USER_DATA_DIR
+        redeemer = BinanceRedeemer(headless=True)
+
+        # 1. User's personal Google Chrome
+        chrome_proc = MagicMock()
+        chrome_proc.pid = 1001
+        chrome_proc.info = {
+            "pid": 1001,
+            "name": "chrome.exe",
+            "cmdline": ["chrome.exe", r"--user-data-dir=C:\Users\User\AppData\Local\Google\Chrome\User Data"],
+        }
+
+        # 2. XAUUSD-AI-Trading-Bot or other Python process
+        trading_bot_proc = MagicMock()
+        trading_bot_proc.pid = 2002
+        trading_bot_proc.info = {
+            "pid": 2002,
+            "name": "python.exe",
+            "cmdline": ["python.exe", r"C:\Users\Mazonia\Desktop\XAUUSD-AI-Trading-Bot\notifications\telegram_bot.py"],
+        }
+
+        # 3. Another tool using Playwright with its own data dir
+        other_playwright_proc = MagicMock()
+        other_playwright_proc.pid = 3003
+        other_playwright_proc.info = {
+            "pid": 3003,
+            "name": "chrome.exe",
+            "cmdline": [r"C:\Users\User\AppData\Local\ms-playwright\chromium\chrome.exe", r"--user-data-dir=C:\Temp\other_agent_data"],
+        }
+
+        # 4. Stale browser strictly belonging to THIS claimer bot
+        stale_claimer_proc = MagicMock()
+        stale_claimer_proc.pid = 4004
+        stale_claimer_proc.info = {
+            "pid": 4004,
+            "name": "chrome.exe",
+            "cmdline": ["chrome.exe", f"--user-data-dir={USER_DATA_DIR}", "--headless=new"],
+        }
+
+        mock_procs = [chrome_proc, trading_bot_proc, other_playwright_proc, stale_claimer_proc]
+
+        with patch("psutil.process_iter", return_value=mock_procs):
+            redeemer._cleanup_stale_locks()
+
+            # Personal Chrome MUST NOT be terminated
+            self.assertFalse(chrome_proc.terminate.called)
+            # Trading bot MUST NOT be terminated
+            self.assertFalse(trading_bot_proc.terminate.called)
+            # Other Playwright session MUST NOT be terminated
+            self.assertFalse(other_playwright_proc.terminate.called)
+            # Only this claimer's browser should be terminated
+            self.assertTrue(stale_claimer_proc.terminate.called)
+
 
 if __name__ == "__main__":
     unittest.main()
