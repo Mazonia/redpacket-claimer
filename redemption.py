@@ -430,11 +430,62 @@ class BinanceRedeemer:
         self.page.set_default_timeout(10000)
         console.print("[bold green][✓] Persistent browser session ready![/bold green]")
 
+    async def reinitialize(self):
+        """Cleanly tears down any zombie browser context and starts a fresh persistent context."""
+        try:
+            if self.page:
+                try:
+                    await self.page.close()
+                except Exception:
+                    pass
+            if self.context:
+                try:
+                    await self.context.close()
+                except Exception:
+                    pass
+            if self._pw:
+                try:
+                    await self._pw.stop()
+                except Exception:
+                    pass
+        except Exception:
+            pass
+        finally:
+            self.context = None
+            self.page = None
+            self._pw = None
+
+        await self.initialize()
+
+    async def ensure_browser_alive(self) -> bool:
+        """
+        Verifies that Chromium context and page are open and responsive.
+        If the browser died (e.g. across system sleep / hibernation / crash),
+        gracefully re-initializes Playwright and reconnects to the Crypto Box page.
+        """
+        try:
+            if not self.context or not self.page:
+                console.print("[dim yellow][!] Browser session not initialized. Starting...[/dim yellow]")
+                await self.initialize()
+                return True
+
+            if hasattr(self.page, "is_closed") and self.page.is_closed():
+                console.print("[dim yellow][!] Browser page was closed during system sleep/idle. Re-opening...[/dim yellow]")
+                await self.reinitialize()
+                return True
+
+            # Quick responsiveness probe
+            _ = self.page.url
+            return True
+        except Exception as e:
+            console.print(f"[dim yellow][!] Browser probe noticed disconnection ({e}). Re-launching session...[/dim yellow]")
+            await self.reinitialize()
+            return True
+
     async def check_login_status(self):
         """Navigates to Binance and verifies active login session."""
-        if not self.page:
-            await self.initialize()
-            
+        await self.ensure_browser_alive()
+        
         console.print(f"[cyan][+] Checking session at {CRYPTO_BOX_URL}...[/cyan]")
         try:
             await self.page.goto(CRYPTO_BOX_URL, wait_until="domcontentloaded", timeout=20000)
@@ -813,8 +864,7 @@ class BinanceRedeemer:
                     "retry_after": remaining_s
                 }
 
-            if not self.page:
-                await self.initialize()
+            await self.ensure_browser_alive()
 
             result = {"code": code, "status": "failed", "message": ""}
 
@@ -1056,8 +1106,7 @@ class BinanceRedeemer:
                     "retry_after": remaining_s
                 }
 
-            if not self.page:
-                await self.initialize()
+            await self.ensure_browser_alive()
 
             result = {"url": post_url, "answer": answer, "status": "failed", "message": ""}
 
@@ -1224,8 +1273,7 @@ class BinanceRedeemer:
                     "retry_after": remaining_s
                 }
 
-            if not self.page:
-                await self.initialize()
+            await self.ensure_browser_alive()
 
             result = {"url": url, "status": "failed", "message": ""}
             for attempt in range(1, max_attempts + 1):

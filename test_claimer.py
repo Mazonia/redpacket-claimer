@@ -305,5 +305,51 @@ class TestProcessIsolation(unittest.TestCase):
             self.assertTrue(stale_claimer_proc.terminate.called)
 
 
+class TestBrowserResilience(unittest.IsolatedAsyncioTestCase):
+    async def test_ensure_browser_alive_triggers_reinit_when_closed(self):
+        redeemer = BinanceRedeemer(headless=True)
+        mock_page = MagicMock()
+        mock_page.is_closed.return_value = True
+        redeemer.page = mock_page
+        redeemer.context = MagicMock()
+
+        with patch.object(redeemer, "reinitialize", new_callable=AsyncMock) as mock_reinit:
+            await redeemer.ensure_browser_alive()
+            mock_reinit.assert_called_once()
+
+    async def test_ensure_browser_alive_passes_when_responsive(self):
+        redeemer = BinanceRedeemer(headless=True)
+        mock_page = MagicMock()
+        mock_page.is_closed.return_value = False
+        mock_page.url = "https://www.binance.com/cryptobox"
+        redeemer.page = mock_page
+        redeemer.context = MagicMock()
+
+        with patch.object(redeemer, "reinitialize", new_callable=AsyncMock) as mock_reinit:
+            result = await redeemer.ensure_browser_alive()
+            self.assertTrue(result)
+            mock_reinit.assert_not_called()
+
+
+class TestSingleInstanceProtection(unittest.TestCase):
+    def test_ensure_single_claimer_instance_terminates_older_instance(self):
+        from main import ensure_single_claimer_instance
+        import os
+
+        cur_dir = os.path.abspath(".").lower()
+        older_proc = MagicMock()
+        older_proc.pid = 99999
+        older_proc.info = {
+            "pid": 99999,
+            "name": "redpacket-claimer.exe",
+            "cmdline": ["redpacket-claimer.exe", "main.py"],
+            "exe": os.path.join(cur_dir, "redpacket-claimer.exe"),
+        }
+
+        with patch("psutil.process_iter", return_value=[older_proc]):
+            ensure_single_claimer_instance()
+            self.assertTrue(older_proc.terminate.called)
+
+
 if __name__ == "__main__":
     unittest.main()

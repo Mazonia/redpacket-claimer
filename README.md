@@ -137,6 +137,22 @@ python main.py
 
 ---
 
+## ⚡ 24/7 Autostart & Sleep Resilience
+
+The bot includes an automated triple-layer Windows autostart system that keeps the claimer running permanently:
+- **Survives PC Sleep & Wake**: Uses Windows Event Triggers (`Microsoft-Windows-Power-Troubleshooter` Event 1) to immediately revive or resume claiming the moment your PC wakes up.
+- **Battery-Immune**: Configured with `-AllowStartIfOnBatteries -DontStopIfGoingOnBatteries` so Windows Task Scheduler never cancels or kills the process when your laptop is unplugged or enters standby.
+- **Auto-Restart Supervisor**: `run.bat` runs an infinite resilience loop that relaunches the claimer within 3 seconds if an unexpected exception occurs.
+- **Triple-Layer Redundancy**: Configures Windows Task Scheduler (Layer 1), Windows Startup folder (Layer 2), and Registry Run (Layer 3).
+
+### Enable Autostart:
+Double-click `setup_autostart.bat` (accept the UAC prompt).
+
+### Disable Autostart:
+Double-click `remove_autostart.bat`.
+
+---
+
 ## 🛡️ Security & Anti-Detection Best Practices
 
 - **Never commit `.env` or `*.session` files**: They contain your sensitive credentials. The repository includes a preconfigured `.gitignore` to prevent leaks.

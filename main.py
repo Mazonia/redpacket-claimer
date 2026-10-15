@@ -45,6 +45,45 @@ def parse_cli_args():
     args, _ = parser.parse_known_args()
     return args
 
+
+def ensure_single_claimer_instance():
+    """
+    Terminates any older/orphaned instance of this claimer process running
+    from this exact directory to prevent session and browser lock conflicts.
+    """
+    try:
+        import psutil
+        cur_pid = os.getpid()
+        cur_dir = os.path.abspath(os.path.dirname(__file__)).lower()
+
+        for p in psutil.process_iter(['pid', 'name', 'cmdline', 'exe']):
+            try:
+                if p.pid == cur_pid:
+                    continue
+                cmdline = p.info.get('cmdline') or []
+                cmd_str = " ".join(cmdline).lower()
+                p_name = p.info.get('name', '').lower()
+                exe_path = (p.info.get('exe') or '').lower()
+
+                is_in_our_dir = (cur_dir in exe_path) or (cur_dir in cmd_str)
+                is_our_claimer = is_in_our_dir and (
+                    "redpacket-claimer" in p_name
+                    or ("main.py" in cmd_str and ("python" in p_name or "redpacket-claimer" in p_name))
+                )
+
+                if is_our_claimer:
+                    console.print(f"[dim yellow][!] Terminating previous claimer instance (PID {p.pid})...[/dim yellow]")
+                    p.terminate()
+                    try:
+                        p.wait(timeout=2.0)
+                    except Exception:
+                        p.kill()
+            except Exception:
+                pass
+    except Exception:
+        pass
+
+
 API_ID = os.getenv("TELEGRAM_API_ID")
 API_HASH = os.getenv("TELEGRAM_API_HASH")
 PHONE = os.getenv("TELEGRAM_PHONE", "").strip()
@@ -181,87 +220,94 @@ claimed_items: Set[str] = load_claimed_cache()
 
 
 async def process_single_item(item_type: str, identifier: str, extra: str = "", timestamp: Optional[float] = None):
-    if identifier in claimed_items:
-        console.print(f"[dim]↷ Skipping already cached {item_type}: {identifier}[/dim]")
-        return
+    try:
+        if identifier in claimed_items:
+            console.print(f"[dim]↷ Skipping already cached {item_type}: {identifier}[/dim]")
+            return
 
-    # Check if account is on active Binance cooldown
-    is_locked, remaining_s, remaining_str = redeemer.is_locked_out()
-    if is_locked:
-        console.print(f"[bold red]⏳ Account on Binance Lockout ({remaining_str} remaining). Cannot claim '{identifier}' now — holding in queue.[/bold red]")
-        enqueue_held_drop(item_type, identifier, extra, timestamp=timestamp)
-        return
+        # Check if account is on active Binance cooldown
+        is_locked, remaining_s, remaining_str = redeemer.is_locked_out()
+        if is_locked:
+            console.print(f"[bold red]⏳ Account on Binance Lockout ({remaining_str} remaining). Cannot claim '{identifier}' now — holding in queue.[/bold red]")
+            enqueue_held_drop(item_type, identifier, extra, timestamp=timestamp)
+            return
 
-    ts = timestamp if timestamp is not None else time.time()
+        ts = timestamp if timestamp is not None else time.time()
 
-    if item_type == "code":
-        console.print(f"[bold gold1]⚡ Claiming Crypto Box Code: [bold white]{identifier}[/bold white][/bold gold1]")
-        res = await redeemer.claim_crypto_box_code(identifier)
-        status = res.get("status", "")
+        if item_type == "code":
+            console.print(f"[bold gold1]⚡ Claiming Crypto Box Code: [bold white]{identifier}[/bold white][/bold gold1]")
+            res = await redeemer.claim_crypto_box_code(identifier)
+            status = res.get("status", "")
 
-        if status in ["success", "expired", "already_claimed", "invalid"]:
-            claimed_items.add(identifier)
-            save_claimed_cache(claimed_items)
-            redeemer.clear_lockout()
-        elif status == "rate_limited":
-            rem_str = redeemer.get_lockout_remaining_str()
-            console.print(Panel(
-                f"[bold red]🚫 BINANCE RATE LIMIT / LOCKOUT ACTIVATED[/bold red]\n"
-                f"[bold white]Code '[bold yellow]{identifier}[/bold yellow]' was queued for auto-redemption when lockout expires.[/bold white]\n"
-                f"[bold yellow]Bot is pausing claims for {rem_str} to protect your account.[/bold yellow]",
-                title="[bold red]Rate Limit Alert[/bold red]",
-                border_style="red"
-            ))
-            enqueue_held_drop(item_type, identifier, extra, timestamp=ts)
-        elif status in ["server_error", "network_timeout"]:
-            console.print(f"[bold yellow][!] Code '{identifier}' hit {status} ({res.get('message')}). Not cached.[/bold yellow]")
-            if (time.time() - ts) < MAX_FRESH_CODE_AGE_SECONDS:
-                console.print(f"[bold cyan]📥 Code '{identifier}' is fresh (< 3m old). Enqueued in held drops to retry when internet stabilizes.[/bold cyan]")
+            if status in ["success", "expired", "already_claimed", "invalid"]:
+                claimed_items.add(identifier)
+                save_claimed_cache(claimed_items)
+                redeemer.clear_lockout()
+            elif status == "rate_limited":
+                rem_str = redeemer.get_lockout_remaining_str()
+                console.print(Panel(
+                    f"[bold red]🚫 BINANCE RATE LIMIT / LOCKOUT ACTIVATED[/bold red]\n"
+                    f"[bold white]Code '[bold yellow]{identifier}[/bold yellow]' was queued for auto-redemption when lockout expires.[/bold white]\n"
+                    f"[bold yellow]Bot is pausing claims for {rem_str} to protect your account.[/bold yellow]",
+                    title="[bold red]Rate Limit Alert[/bold red]",
+                    border_style="red"
+                ))
                 enqueue_held_drop(item_type, identifier, extra, timestamp=ts)
-        else:
-            console.print(f"[bold yellow][!] Code '{identifier}' returned status '{status}' ({res.get('message')}). Not cached.[/bold yellow]")
+            elif status in ["server_error", "network_timeout"]:
+                console.print(f"[bold yellow][!] Code '{identifier}' hit {status} ({res.get('message')}). Not cached.[/bold yellow]")
+                if (time.time() - ts) < MAX_FRESH_CODE_AGE_SECONDS:
+                    console.print(f"[bold cyan]📥 Code '{identifier}' is fresh (< 3m old). Enqueued in held drops to retry when internet stabilizes.[/bold cyan]")
+                    enqueue_held_drop(item_type, identifier, extra, timestamp=ts)
+            else:
+                console.print(f"[bold yellow][!] Code '{identifier}' returned status '{status}' ({res.get('message')}). Not cached.[/bold yellow]")
 
-    elif item_type == "square":
-        console.print(f"[bold gold1]⚡ Claiming Binance Square Post: [bold white]{identifier}[/bold white] (Answer: [bold yellow]{extra}[/bold yellow])[/bold gold1]")
-        res = await redeemer.claim_binance_square_red_packet(identifier, extra)
-        status = res.get("status", "")
+        elif item_type == "square":
+            console.print(f"[bold gold1]⚡ Claiming Binance Square Post: [bold white]{identifier}[/bold white] (Answer: [bold yellow]{extra}[/bold yellow])[/bold gold1]")
+            res = await redeemer.claim_binance_square_red_packet(identifier, extra)
+            status = res.get("status", "")
 
-        if status in ["success", "submitted", "opened", "expired", "already_claimed", "invalid"]:
-            claimed_items.add(identifier)
-            save_claimed_cache(claimed_items)
-            redeemer.clear_lockout()
-        elif status == "rate_limited":
-            rem_str = redeemer.get_lockout_remaining_str()
-            console.print(f"[bold red]🚫 Lockout active ({rem_str} remaining). Square post '{identifier}' held in queue.[/bold red]")
-            enqueue_held_drop(item_type, identifier, extra, timestamp=ts)
-        elif status in ["server_error", "network_timeout"]:
-            console.print(f"[bold yellow][!] Square post '{identifier}' hit {status}. Not cached.[/bold yellow]")
-            if (time.time() - ts) < MAX_FRESH_CODE_AGE_SECONDS:
-                console.print(f"[bold cyan]📥 Square post '{identifier}' is fresh. Enqueued in held drops to retry when internet stabilizes.[/bold cyan]")
+            if status in ["success", "submitted", "opened", "expired", "already_claimed", "invalid"]:
+                claimed_items.add(identifier)
+                save_claimed_cache(claimed_items)
+                redeemer.clear_lockout()
+            elif status == "rate_limited":
+                rem_str = redeemer.get_lockout_remaining_str()
+                console.print(f"[bold red]🚫 Lockout active ({rem_str} remaining). Square post '{identifier}' held in queue.[/bold red]")
                 enqueue_held_drop(item_type, identifier, extra, timestamp=ts)
-        else:
-            console.print(f"[bold yellow][!] Square post '{identifier}' returned '{status}'. Not cached.[/bold yellow]")
+            elif status in ["server_error", "network_timeout"]:
+                console.print(f"[bold yellow][!] Square post '{identifier}' hit {status}. Not cached.[/bold yellow]")
+                if (time.time() - ts) < MAX_FRESH_CODE_AGE_SECONDS:
+                    console.print(f"[bold cyan]📥 Square post '{identifier}' is fresh. Enqueued in held drops to retry when internet stabilizes.[/bold cyan]")
+                    enqueue_held_drop(item_type, identifier, extra, timestamp=ts)
+            else:
+                console.print(f"[bold yellow][!] Square post '{identifier}' returned '{status}'. Not cached.[/bold yellow]")
 
-    elif item_type == "url":
-        console.print(f"[bold gold1]⚡ Opening Red Packet Link: [bold white]{identifier}[/bold white][/bold gold1]")
-        res = await redeemer.claim_red_packet_url(identifier)
-        status = res.get("status", "")
+        elif item_type == "url":
+            console.print(f"[bold gold1]⚡ Opening Red Packet Link: [bold white]{identifier}[/bold white][/bold gold1]")
+            res = await redeemer.claim_red_packet_url(identifier)
+            status = res.get("status", "")
 
-        if status in ["success", "opened", "expired", "already_claimed", "invalid"]:
-            claimed_items.add(identifier)
-            save_claimed_cache(claimed_items)
-            redeemer.clear_lockout()
-        elif status == "rate_limited":
-            rem_str = redeemer.get_lockout_remaining_str()
-            console.print(f"[bold red]🚫 Lockout active ({rem_str} remaining). Link '{identifier}' held in queue.[/bold red]")
-            enqueue_held_drop(item_type, identifier, extra, timestamp=ts)
-        elif status in ["server_error", "network_timeout"]:
-            console.print(f"[bold yellow][!] Link '{identifier}' hit {status}. Not cached.[/bold yellow]")
-            if (time.time() - ts) < MAX_FRESH_CODE_AGE_SECONDS:
-                console.print(f"[bold cyan]📥 Link '{identifier}' is fresh. Enqueued in held drops to retry when internet stabilizes.[/bold cyan]")
+            if status in ["success", "opened", "expired", "already_claimed", "invalid"]:
+                claimed_items.add(identifier)
+                save_claimed_cache(claimed_items)
+                redeemer.clear_lockout()
+            elif status == "rate_limited":
+                rem_str = redeemer.get_lockout_remaining_str()
+                console.print(f"[bold red]🚫 Lockout active ({rem_str} remaining). Link '{identifier}' held in queue.[/bold red]")
                 enqueue_held_drop(item_type, identifier, extra, timestamp=ts)
-        else:
-            console.print(f"[bold yellow][!] Link '{identifier}' returned '{status}'. Not cached.[/bold yellow]")
+            elif status in ["server_error", "network_timeout"]:
+                console.print(f"[bold yellow][!] Link '{identifier}' hit {status}. Not cached.[/bold yellow]")
+                if (time.time() - ts) < MAX_FRESH_CODE_AGE_SECONDS:
+                    console.print(f"[bold cyan]📥 Link '{identifier}' is fresh. Enqueued in held drops to retry when internet stabilizes.[/bold cyan]")
+                    enqueue_held_drop(item_type, identifier, extra, timestamp=ts)
+            else:
+                console.print(f"[bold yellow][!] Link '{identifier}' returned '{status}'. Not cached.[/bold yellow]")
+    except Exception as e:
+        console.print(f"[bold red][!] Error while processing {item_type} '{identifier}': {e}[/bold red]")
+        try:
+            await redeemer.ensure_browser_alive()
+        except Exception:
+            pass
 
 
 async def scan_and_claim_history(channel_entities: List[Any], catchup_limit: int = 35):
@@ -528,7 +574,9 @@ async def connect_and_listen(catchup_limit: int = 35):
             console.print("[bold yellow][!] Telegram connection disconnected.[/bold yellow]")
 
         except asyncio.CancelledError:
-            break
+            console.print("[dim yellow][!] Telegram listener interrupted across sleep/power transition. Auto-reconnecting in 3s...[/dim yellow]")
+            await asyncio.sleep(3)
+            continue
         except KeyboardInterrupt:
             raise
         except Exception as e:
@@ -557,7 +605,8 @@ async def connect_and_listen(catchup_limit: int = 35):
                         status.update(f"[bold yellow]⏳ Telegram offline. Reconnecting in {format_delay_text(remaining)} (Attempt #{attempt_num})...[/bold yellow]")
                     await asyncio.sleep(1)
         except asyncio.CancelledError:
-            break
+            console.print("[dim yellow][!] Sleep/resume event detected during countdown. Re-initiating connection immediately...[/dim yellow]")
+            continue
         except KeyboardInterrupt:
             raise
 
@@ -687,9 +736,17 @@ async def main():
     lockout_task = asyncio.create_task(lockout_queue_monitor())
 
     try:
-        await redeemer.initialize()
-        await redeemer.check_login_status()
-        await connect_and_listen(catchup_limit=cli_args.catchup)
+        while True:
+            try:
+                await redeemer.initialize()
+                await redeemer.check_login_status()
+                await connect_and_listen(catchup_limit=cli_args.catchup)
+            except KeyboardInterrupt:
+                raise
+            except Exception as e:
+                console.print(f"\n[bold red][!] Main listener encountered error: {e}[/bold red]")
+                console.print("[bold yellow]🔄 Restarting listener in 5s...[/bold yellow]")
+                await asyncio.sleep(5)
     finally:
         lockout_task.cancel()
         try:
@@ -708,6 +765,7 @@ async def main():
 
 
 if __name__ == "__main__":
+    ensure_single_claimer_instance()
     try:
         asyncio.run(main())
     except KeyboardInterrupt:
@@ -716,4 +774,7 @@ if __name__ == "__main__":
         console.print(f"\n[bold red][!] Unhandled Error: {e}[/bold red]")
         import traceback
         traceback.print_exc()
-        input("\nPress Enter to exit...")
+        if sys.stdin and hasattr(sys.stdin, "isatty") and sys.stdin.isatty():
+            input("\nPress Enter to exit...")
+        else:
+            time.sleep(5)
