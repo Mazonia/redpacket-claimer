@@ -76,7 +76,7 @@ powershell -NoProfile -ExecutionPolicy Bypass -Command "& { try { $dir = '%CUR_D
   <Actions Context=\"Author\">
     <Exec>
       <Command>wscript.exe</Command>
-      <Arguments>\"\"\"$vbs\"\"\"</Arguments>
+      <Arguments>\"\"\"$vbs\"\"\" /silent</Arguments>
       <WorkingDirectory>$dir</WorkingDirectory>
     </Exec>
   </Actions>
@@ -86,12 +86,12 @@ powershell -NoProfile -ExecutionPolicy Bypass -Command "& { try { $dir = '%CUR_D
 :: 3. Register Windows Startup Folder Shortcut (Layer 2)
 echo [2/3] Creating Windows Startup folder shortcut...
 set "STARTUP_DIR=%APPDATA%\Microsoft\Windows\Start Menu\Programs\Startup"
-powershell -NoProfile -ExecutionPolicy Bypass -Command "& { $ws = New-Object -ComObject WScript.Shell; $sc = $ws.CreateShortcut('%STARTUP_DIR%\Binance-RedPacket-Claimer.lnk'); $sc.TargetPath = 'wscript.exe'; $sc.Arguments = '\"%CUR_DIR%\start_hidden.vbs\"'; $sc.WorkingDirectory = '%CUR_DIR%'; $sc.Description = 'Binance Red Packet & Feed Auto-Claimer'; $sc.Save(); }" >nul 2>&1
+powershell -NoProfile -ExecutionPolicy Bypass -Command "& { $ws = New-Object -ComObject WScript.Shell; $sc = $ws.CreateShortcut('%STARTUP_DIR%\Binance-RedPacket-Claimer.lnk'); $sc.TargetPath = 'wscript.exe'; $sc.Arguments = '\"%CUR_DIR%\start_hidden.vbs\" /silent'; $sc.WorkingDirectory = '%CUR_DIR%'; $sc.Description = 'Binance Red Packet & Feed Auto-Claimer'; $sc.Save(); }" >nul 2>&1
 echo     [+] Startup folder shortcut created!
 
 :: 4. Register Windows Registry Run Key (Layer 3)
 echo [3/3] Registering in Windows CurrentUser Run registry...
-reg add "HKCU\Software\Microsoft\Windows\CurrentVersion\Run" /v "Binance-RedPacket-Claimer" /t REG_SZ /d "wscript.exe \"%CUR_DIR%\start_hidden.vbs\"" /f >nul 2>&1
+reg add "HKCU\Software\Microsoft\Windows\CurrentVersion\Run" /v "Binance-RedPacket-Claimer" /t REG_SZ /d "wscript.exe \"%CUR_DIR%\start_hidden.vbs\" /silent" /f >nul 2>&1
 echo     [+] Registry Run entry registered!
 
 echo.

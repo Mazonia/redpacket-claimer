@@ -18,8 +18,20 @@ if not exist redpacket-claimer.exe (
 :run_loop
 echo [%TIME%] Starting Red Packet Claimer as [redpacket-claimer.exe]...
 redpacket-claimer.exe main.py %*
+set EXIT_CODE=%errorlevel%
+
 echo.
-echo [%TIME%] [!] Claimer process exited with code %errorlevel%.
+if %EXIT_CODE% equ 0 (
+    echo [%TIME%] Claimer process stopped cleanly.
+    exit /b 0
+)
+
+if %EXIT_CODE% equ 42 (
+    echo [%TIME%] Another instance is already active. Exiting.
+    exit /b 0
+)
+
+echo [%TIME%] [!] Claimer process exited with code %EXIT_CODE%.
 echo [%TIME%] Auto-restarting in 3 seconds (Press Ctrl+C to stop)...
 timeout /t 3 /nobreak >nul
 goto :run_loop

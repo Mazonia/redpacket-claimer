@@ -50,6 +50,8 @@ def ensure_single_claimer_instance():
     """
     Terminates any older/orphaned instance of this claimer process running
     from this exact directory to prevent session and browser lock conflicts.
+    Also terminates the older instance's parent supervisor (cmd.exe / run.bat)
+    so it does not auto-restart in a competing loop.
     """
     try:
         import psutil
@@ -73,6 +75,35 @@ def ensure_single_claimer_instance():
 
                 if is_our_claimer:
                     console.print(f"[dim yellow][!] Terminating previous claimer instance (PID {p.pid})...[/dim yellow]")
+                    # 1. Terminate parent supervisor (e.g. run.bat) first so it cannot resurrect this process
+                    try:
+                        parent = p.parent() if callable(getattr(p, "parent", None)) else None
+                        if parent and getattr(parent, "pid", None) != cur_pid:
+                            p_parent_name = str(parent.name() if callable(getattr(parent, "name", None)) else getattr(parent, "name", "")).lower()
+                            cmd_list = parent.cmdline() if callable(getattr(parent, "cmdline", None)) else getattr(parent, "cmdline", [])
+                            p_parent_cmd = " ".join([str(c) for c in (cmd_list or [])]).lower()
+                            if ("cmd" in p_parent_name and "run.bat" in p_parent_cmd) or (cur_dir in p_parent_cmd):
+                                parent.terminate()
+                                try:
+                                    parent.wait(timeout=1.0)
+                                except Exception:
+                                    parent.kill()
+                    except Exception:
+                        pass
+
+                    # 2. Terminate any lingering child processes (e.g. browser instances)
+                    try:
+                        children = p.children(recursive=True) if callable(getattr(p, "children", None)) else []
+                        if isinstance(children, (list, tuple)):
+                            for child in children:
+                                try:
+                                    child.terminate()
+                                except Exception:
+                                    pass
+                    except Exception:
+                        pass
+
+                    # 3. Terminate the older claimer process
                     p.terminate()
                     try:
                         p.wait(timeout=2.0)
@@ -770,6 +801,7 @@ if __name__ == "__main__":
         asyncio.run(main())
     except KeyboardInterrupt:
         console.print("\n[bold yellow][!] Bot stopped by user.[/bold yellow]")
+        sys.exit(0)
     except Exception as e:
         console.print(f"\n[bold red][!] Unhandled Error: {e}[/bold red]")
         import traceback
@@ -778,3 +810,4 @@ if __name__ == "__main__":
             input("\nPress Enter to exit...")
         else:
             time.sleep(5)
+        sys.exit(1)

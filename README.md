@@ -145,10 +145,14 @@ The bot includes an automated triple-layer Windows autostart system that keeps t
 - **Auto-Restart Supervisor**: `run.bat` runs an infinite resilience loop that relaunches the claimer within 3 seconds if an unexpected exception occurs.
 - **Triple-Layer Redundancy**: Configures Windows Task Scheduler (Layer 1), Windows Startup folder (Layer 2), and Registry Run (Layer 3).
 
-### Enable Autostart:
+### Background Execution & Management:
+- **Run Hidden in Background**: Double-click `start_hidden.vbs` (runs silently in headless mode with instant confirmation popup and duplicate protection).
+- **Stop Background Claimer**: Double-click `stop.bat` (instantly terminates all background claimer processes, supervisors, and browser sessions).
+
+### Enable 24/7 Autostart:
 Double-click `setup_autostart.bat` (accept the UAC prompt).
 
-### Disable Autostart:
+### Disable 24/7 Autostart:
 Double-click `remove_autostart.bat`.
 
 ---
