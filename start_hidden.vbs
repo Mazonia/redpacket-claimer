@@ -59,7 +59,7 @@ If WScript.Arguments.Count > 0 Then
     Next
 End If
 
-WshShell.Run "cmd.exe /c run.bat " & strArgs, 0, False
+WshShell.Run "cmd.exe /c """ & strCurDir & "\run.bat"" " & strArgs, 0, False
 
 If Not bSilent Then
     WshShell.Popup "Binance Red Packet Auto-Claimer started in background (Headless Mode)." & vbCrLf & vbCrLf & "To stop: run stop.bat" & vbCrLf & "To monitor: view claimed_cache.json", 3, "Claimer Started", 64

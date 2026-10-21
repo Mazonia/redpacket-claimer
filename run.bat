@@ -33,5 +33,5 @@ if %EXIT_CODE% equ 42 (
 
 echo [%TIME%] [!] Claimer process exited with code %EXIT_CODE%.
 echo [%TIME%] Auto-restarting in 3 seconds (Press Ctrl+C to stop)...
-timeout /t 3 /nobreak >nul
+ping -n 4 127.0.0.1 >nul 2>&1
 goto :run_loop
