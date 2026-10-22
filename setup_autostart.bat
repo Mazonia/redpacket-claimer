@@ -2,7 +2,7 @@
 @echo off
 title Binance Red Packet Claimer - Setup Auto-Start
 cd /d "%~dp0"
-powershell.exe -NoProfile -ExecutionPolicy Bypass -Command "$env:SCRIPT_DIR='%~dp0'; $env:BATCH_PATH='%~f0'; Invoke-Expression ([System.IO.File]::ReadAllText('%~f0'))"
+powershell.exe -NoProfile -ExecutionPolicy Bypass -Command "$env:SCRIPT_DIR='%~dp0'; $env:BATCH_PATH='%~f0'; $env:SETUP_ARGS='%*'; Invoke-Expression ([System.IO.File]::ReadAllText('%~f0'))"
 exit /b %errorlevel%
 #>
 
@@ -42,6 +42,7 @@ $claimerExe = Join-Path $scriptDir "redpacket-claimer.exe"
 # Ensure redpacket-claimer.exe exists
 if (-not (Test-Path $claimerExe)) {
     $pyCmd = Get-Command python -ErrorAction SilentlyContinue
+    if (-not $pyCmd) { $pyCmd = Get-Command py -ErrorAction SilentlyContinue }
     if ($pyCmd) {
         try {
             Copy-Item -Path $pyCmd.Source -Destination $claimerExe -Force
@@ -62,7 +63,7 @@ if (-not $isAdmin) {
     try {
         $psi = New-Object System.Diagnostics.ProcessStartInfo
         $psi.FileName = "powershell.exe"
-        $psi.Arguments = "-NoProfile -ExecutionPolicy Bypass -Command `"`$env:SCRIPT_DIR='$scriptDir'; `$env:BATCH_PATH='$batchPath'; Invoke-Expression ([System.IO.File]::ReadAllText('$batchPath'))`""
+        $psi.Arguments = "-NoProfile -ExecutionPolicy Bypass -Command `"`$env:SCRIPT_DIR='$scriptDir'; `$env:BATCH_PATH='$batchPath'; `$env:SETUP_ARGS='$($env:SETUP_ARGS)'; Invoke-Expression ([System.IO.File]::ReadAllText('$batchPath'))`""
         $psi.Verb = "RunAs"
         $psi.UseShellExecute = $true
         $elevatedProc = [System.Diagnostics.Process]::Start($psi)
@@ -74,12 +75,13 @@ if (-not $isAdmin) {
     }
 }
 
-# Layer 1: Register Task Scheduler Task
-Write-Host ""
-Write-Host "[1/3] Registering Task Scheduler task (Logon + Sleep Wake triggers)..." -ForegroundColor White
+# Layer 1: Register Task Scheduler Task (Logon + Sleep Wakeup triggers - requires Administrator)
 $taskRegistered = $false
-try {
-    $xml = @"
+if ($isAdmin) {
+    Write-Host ""
+    Write-Host "[1/3] Registering Task Scheduler task (Logon + Sleep Wake triggers)..." -ForegroundColor White
+    try {
+        $xml = @"
 <?xml version="1.0" encoding="UTF-16"?>
 <Task version="1.2" xmlns="http://schemas.microsoft.com/windows/2004/02/mit/task">
   <Triggers>
@@ -123,28 +125,33 @@ try {
   <Actions Context="Author">
     <Exec>
       <Command>wscript.exe</Command>
-      <Arguments>"`"$vbsPath`" /silent"</Arguments>
+      <Arguments>"$vbsPath" /silent</Arguments>
       <WorkingDirectory>$scriptDir</WorkingDirectory>
     </Exec>
   </Actions>
 </Task>
 "@
-    Register-ScheduledTask -TaskName 'Binance-RedPacket-Claimer' -Xml $xml -Force -ErrorAction Stop | Out-Null
-    Write-Step "Task Scheduler registered successfully (Logon + Wake-from-sleep)!" "success"
-    $taskRegistered = $true
-} catch {
-    Write-Step "XML-based Task Scheduler registration failed: $($_.Exception.Message)" "warning"
-    Write-Step "Attempting native PowerShell cmdlet fallback..." "info"
-    try {
-        $action = New-ScheduledTaskAction -Execute "wscript.exe" -Argument "`"$vbsPath`" /silent" -WorkingDirectory $scriptDir
-        $trigger = New-ScheduledTaskTrigger -AtLogOn
-        $settings = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries -ExecutionTimeLimit ([TimeSpan]::Zero) -DontStopOnIdleEnd
-        Register-ScheduledTask -TaskName "Binance-RedPacket-Claimer" -Action $action -Trigger $trigger -Settings $settings -Force -ErrorAction Stop | Out-Null
-        Write-Step "Task Scheduler registered successfully via fallback!" "success"
+        Register-ScheduledTask -TaskName 'Binance-RedPacket-Claimer' -Xml $xml -Force -ErrorAction Stop | Out-Null
+        Write-Step "Task Scheduler registered successfully (Logon + Wake-from-sleep)!" "success"
         $taskRegistered = $true
     } catch {
-        Write-Step "Task Scheduler registration unavailable: $($_.Exception.Message)" "warning"
+        Write-Step "XML-based Task Scheduler registration failed: $($_.Exception.Message)" "warning"
+        Write-Step "Attempting native PowerShell cmdlet fallback..." "info"
+        try {
+            $action = New-ScheduledTaskAction -Execute "wscript.exe" -Argument "`"$vbsPath`" /silent" -WorkingDirectory $scriptDir
+            $trigger = New-ScheduledTaskTrigger -AtLogOn
+            $settings = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries -ExecutionTimeLimit ([TimeSpan]::Zero) -DontStopOnIdleEnd
+            Register-ScheduledTask -TaskName "Binance-RedPacket-Claimer" -Action $action -Trigger $trigger -Settings $settings -Force -ErrorAction Stop | Out-Null
+            Write-Step "Task Scheduler registered successfully via fallback!" "success"
+            $taskRegistered = $true
+        } catch {
+            Write-Step "Task Scheduler registration unavailable: $($_.Exception.Message)" "warning"
+        }
     }
+} else {
+    Write-Host ""
+    Write-Host "[1/3] Task Scheduler registration skipped (requires Administrator privileges)." -ForegroundColor Gray
+    Write-Host "      Using Startup folder shortcut and Registry Run key for standard autostart." -ForegroundColor Gray
 }
 
 # Layer 2: Register Windows Startup Folder Shortcut
@@ -155,6 +162,9 @@ try {
     $startupDir = [Environment]::GetFolderPath('Startup')
     if (-not $startupDir -or -not (Test-Path $startupDir)) {
         $startupDir = Join-Path $env:APPDATA "Microsoft\Windows\Start Menu\Programs\Startup"
+    }
+    if (-not (Test-Path $startupDir)) {
+        New-Item -ItemType Directory -Path $startupDir -Force | Out-Null
     }
     $shortcutPath = Join-Path $startupDir "Binance-RedPacket-Claimer.lnk"
     
@@ -202,13 +212,16 @@ if ($startupShortcutCreated) { Write-Host "  [OK] Windows Startup Folder Shortcu
 if ($registryCreated) { Write-Host "  [OK] Windows Registry Run Key (Current User)" -ForegroundColor Green }
 Write-Host ""
 
-$ans = Read-Host "Do you want to launch the Auto-Claimer in the background right now? (Y/N)"
-if ($ans -and $ans.Trim().ToUpper() -eq "Y") {
-    Write-Host "Starting Binance Auto-Claimer in background..." -ForegroundColor Cyan
-    Start-Process "wscript.exe" -ArgumentList "`"$vbsPath`""
-    Start-Sleep -Seconds 2
-    Write-Step "Auto-Claimer triggered in background!" "success"
+$isNonInteractive = ($env:SETUP_ARGS -match 'noninteractive|silent|-y|/y') -or [Console]::IsInputRedirected
+if (-not $isNonInteractive) {
+    $ans = Read-Host "Do you want to launch the Auto-Claimer in the background right now? (Y/N)"
+    if ($ans -and $ans.Trim().ToUpper() -eq "Y") {
+        Write-Host "Starting Binance Auto-Claimer in background..." -ForegroundColor Cyan
+        Start-Process "wscript.exe" -ArgumentList "`"$vbsPath`""
+        Start-Sleep -Seconds 2
+        Write-Step "Auto-Claimer triggered in background!" "success"
+    }
+    Write-Host ""
+    Write-Host "Press Enter to exit..." -ForegroundColor Gray
+    Read-Host | Out-Null
 }
-Write-Host ""
-Write-Host "Press Enter to exit..." -ForegroundColor Gray
-Read-Host | Out-Null

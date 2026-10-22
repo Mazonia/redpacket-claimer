@@ -2,7 +2,7 @@
 @echo off
 title Binance Red Packet Claimer - Remove Auto-Start
 cd /d "%~dp0"
-powershell.exe -NoProfile -ExecutionPolicy Bypass -Command "$env:SCRIPT_DIR='%~dp0'; $env:BATCH_PATH='%~f0'; Invoke-Expression ([System.IO.File]::ReadAllText('%~f0'))"
+powershell.exe -NoProfile -ExecutionPolicy Bypass -Command "$env:SCRIPT_DIR='%~dp0'; $env:BATCH_PATH='%~f0'; $env:SETUP_ARGS='%*'; Invoke-Expression ([System.IO.File]::ReadAllText('%~f0'))"
 exit /b %errorlevel%
 #>
 
@@ -41,7 +41,7 @@ if (-not $isAdmin) {
     try {
         $psi = New-Object System.Diagnostics.ProcessStartInfo
         $psi.FileName = "powershell.exe"
-        $psi.Arguments = "-NoProfile -ExecutionPolicy Bypass -Command `"`$env:SCRIPT_DIR='$scriptDir'; `$env:BATCH_PATH='$batchPath'; Invoke-Expression ([System.IO.File]::ReadAllText('$batchPath'))`""
+        $psi.Arguments = "-NoProfile -ExecutionPolicy Bypass -Command `"`$env:SCRIPT_DIR='$scriptDir'; `$env:BATCH_PATH='$batchPath'; `$env:SETUP_ARGS='$($env:SETUP_ARGS)'; Invoke-Expression ([System.IO.File]::ReadAllText('$batchPath'))`""
         $psi.Verb = "RunAs"
         $psi.UseShellExecute = $true
         $elevatedProc = [System.Diagnostics.Process]::Start($psi)
@@ -55,21 +55,25 @@ if (-not $isAdmin) {
 
 # 1. Remove Task Scheduler Task
 Write-Host "[1/3] Removing Task Scheduler task..." -ForegroundColor White
-try {
-    $existing = Get-ScheduledTask -TaskName 'Binance-RedPacket-Claimer' -ErrorAction SilentlyContinue
-    if ($existing) {
-        Unregister-ScheduledTask -TaskName 'Binance-RedPacket-Claimer' -Confirm:$false -ErrorAction Stop
-        Write-Step "Task Scheduler task removed." "success"
-    } else {
-        Write-Step "No Task Scheduler task found or already removed." "info"
+if ($isAdmin) {
+    try {
+        $existing = Get-ScheduledTask -TaskName 'Binance-RedPacket-Claimer' -ErrorAction SilentlyContinue
+        if ($existing) {
+            Unregister-ScheduledTask -TaskName 'Binance-RedPacket-Claimer' -Confirm:$false -ErrorAction Stop
+            Write-Step "Task Scheduler task removed." "success"
+        } else {
+            Write-Step "No Task Scheduler task found or already removed." "info"
+        }
+    } catch {
+        $schtasksRes = & schtasks /delete /tn "Binance-RedPacket-Claimer" /f 2>&1
+        if ($LASTEXITCODE -eq 0) {
+            Write-Step "Task Scheduler task removed via schtasks." "success"
+        } else {
+            Write-Step "Task Scheduler task not present or already removed." "info"
+        }
     }
-} catch {
-    $schtasksRes = & schtasks /delete /tn "Binance-RedPacket-Claimer" /f 2>&1
-    if ($LASTEXITCODE -eq 0) {
-        Write-Step "Task Scheduler task removed via schtasks." "success"
-    } else {
-        Write-Step "Task Scheduler task not present or already removed." "info"
-    }
+} else {
+    Write-Step "Task Scheduler task requires Administrator privileges to remove (skipped)." "info"
 }
 
 # 2. Remove Windows Startup Folder Shortcut
@@ -112,5 +116,9 @@ Write-Host "=======================================================" -Foreground
 Write-Host "   Auto-Start has been completely disabled." -ForegroundColor Green
 Write-Host "=======================================================" -ForegroundColor Cyan
 Write-Host ""
-Write-Host "Press Enter to exit..." -ForegroundColor Gray
-Read-Host | Out-Null
+
+$isNonInteractive = ($env:SETUP_ARGS -match 'noninteractive|silent|-y|/y') -or [Console]::IsInputRedirected
+if (-not $isNonInteractive) {
+    Write-Host "Press Enter to exit..." -ForegroundColor Gray
+    Read-Host | Out-Null
+}

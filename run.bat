@@ -7,17 +7,40 @@ echo       BINANCE RED PACKET AUTO-CLAIMER
 echo ==============================================
 echo.
 
-:: Create dedicated named executable so Task Manager displays 'redpacket-claimer.exe' instead of generic 'python.exe'
-for /f "delims=" %%i in ('where python') do set SYSTEM_PY=%%i & goto :found_py
-:found_py
+:: Ensure dedicated named executable exists so Task Manager displays 'redpacket-claimer.exe' instead of generic 'python.exe'
+set "PY_EXE="
+if exist "%~dp0redpacket-claimer.exe" (
+    set "PY_EXE=%~dp0redpacket-claimer.exe"
+) else (
+    for /f "delims=" %%i in ('where python 2^>nul') do (
+        set "SYSTEM_PY=%%i"
+        goto :copy_py
+    )
+    for /f "delims=" %%i in ('where py 2^>nul') do (
+        set "SYSTEM_PY=%%i"
+        goto :copy_py
+    )
+    goto :no_py
 
-if not exist redpacket-claimer.exe (
-    copy "%SYSTEM_PY%" redpacket-claimer.exe >nul
+    :copy_py
+    copy "%SYSTEM_PY%" "%~dp0redpacket-claimer.exe" >nul 2>&1
+    if exist "%~dp0redpacket-claimer.exe" (
+        set "PY_EXE=%~dp0redpacket-claimer.exe"
+    ) else (
+        set "PY_EXE=%SYSTEM_PY%"
+    )
 )
 
+goto :run_loop
+
+:no_py
+echo [%TIME%] [!] ERROR: Python executable not found in PATH or directory.
+echo [%TIME%] Please install Python from python.org and add it to your system PATH.
+exit /b 1
+
 :run_loop
-echo [%TIME%] Starting Red Packet Claimer as [redpacket-claimer.exe]...
-redpacket-claimer.exe main.py %*
+echo [%TIME%] Starting Red Packet Claimer as [%PY_EXE%]...
+"%PY_EXE%" main.py %*
 set EXIT_CODE=%errorlevel%
 
 echo.
@@ -27,7 +50,7 @@ if %EXIT_CODE% equ 0 (
 )
 
 if %EXIT_CODE% equ 42 (
-    echo [%TIME%] Another instance is already active. Exiting.
+    echo [%TIME%] Another instance is already active. Exiting cleanly.
     exit /b 0
 )
 

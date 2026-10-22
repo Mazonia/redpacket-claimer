@@ -351,5 +351,39 @@ class TestSingleInstanceProtection(unittest.TestCase):
             self.assertTrue(older_proc.terminate.called)
 
 
+class TestAutostartScripts(unittest.TestCase):
+    def test_setup_autostart_task_scheduler_quoting(self):
+        """Verify setup_autostart.bat does not generate corrupt doubled quotes in Task Scheduler XML."""
+        setup_bat_path = os.path.join(os.path.dirname(__file__), "setup_autostart.bat")
+        with open(setup_bat_path, "r", encoding="utf-8", errors="ignore") as f:
+            content = f.read()
+
+        # Check for corrupt doubled quotes in Arguments
+        self.assertNotIn('<Arguments>"`"$vbsPath`" /silent"</Arguments>', content)
+        self.assertIn('<Arguments>"$vbsPath" /silent</Arguments>', content)
+
+    def test_start_hidden_vbs_cmd_quoting_and_lock(self):
+        """Verify start_hidden.vbs includes atomic start.lock and call keyword for spaces safety."""
+        vbs_path = os.path.join(os.path.dirname(__file__), "start_hidden.vbs")
+        with open(vbs_path, "r", encoding="utf-8", errors="ignore") as f:
+            content = f.read()
+
+        # Must use 'call' to protect against CMD outer quote stripping on paths with spaces
+        self.assertIn("cmd.exe /c call", content)
+        # Must implement atomic startup lock
+        self.assertIn("start.lock", content)
+
+    def test_run_bat_python_fallback(self):
+        """Verify run.bat does not crash with infinite loop when python is missing."""
+        run_bat_path = os.path.join(os.path.dirname(__file__), "run.bat")
+        with open(run_bat_path, "r", encoding="utf-8", errors="ignore") as f:
+            content = f.read()
+
+        # Must have clean error exit if Python not found
+        self.assertIn(":no_py", content)
+        self.assertIn("exit /b 1", content)
+
+
 if __name__ == "__main__":
     unittest.main()
+
