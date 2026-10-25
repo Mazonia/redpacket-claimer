@@ -4,11 +4,13 @@ import re
 import json
 import time
 import asyncio
+import logging
 import argparse
 from datetime import datetime, timezone
 from typing import Set, Dict, Any, List, Optional
 from dotenv import load_dotenv
 from telethon import TelegramClient, events
+from telethon.network.connection import ConnectionTcpIntermediate
 from rich.console import Console
 from rich.panel import Panel
 from rich.table import Table
@@ -36,11 +38,41 @@ console = Console()
 LOG_FILE = os.path.abspath("./claimer.log")
 STATUS_FILE = os.path.abspath("./worker_status.json")
 
+# Configure Telethon logger: route warnings & network errors to LOG_FILE with timestamps
+telethon_logger = logging.getLogger("telethon")
+telethon_logger.setLevel(logging.WARNING)
+if not telethon_logger.handlers:
+    fh = logging.FileHandler(LOG_FILE, encoding="utf-8")
+    fh.setFormatter(logging.Formatter("[%(asctime)s] [TELEGRAM] %(message)s", datefmt="%Y-%m-%d %H:%M:%S"))
+    telethon_logger.addHandler(fh)
+telethon_logger.propagate = False
 
-def log_print(msg: str, end: str = "\n"):
-    """Prints to Rich console and appends clean timestamped text to claimer.log."""
+
+def log_print(msg: Any, end: str = "\n"):
+    """Prints to Rich console and appends clean timestamped text to claimer.log (supports strings, Panels, and renderables)."""
     now_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-    clean_text = re.sub(r'\[/?[a-zA-Z0-9_# =,-]+\]', '', msg)
+    clean_text = ""
+    try:
+        if isinstance(msg, str):
+            clean_text = re.sub(r'\[/?[a-zA-Z0-9_# =,-]+\]', '', msg)
+        else:
+            # Handle Rich renderables (Panel, Table, Text) and generic objects
+            clean_title = ""
+            if hasattr(msg, "title") and msg.title:
+                clean_title = re.sub(r'\[/?[a-zA-Z0-9_# =,-]+\]', '', str(msg.title)).strip()
+
+            inner = getattr(msg, "renderable", str(msg))
+            clean_inner = re.sub(r'\[/?[a-zA-Z0-9_# =,-]+\]', '', str(inner)).strip()
+
+            if clean_title and clean_inner:
+                clean_text = f"--- {clean_title} ---\n{clean_inner}"
+            elif clean_title:
+                clean_text = f"--- {clean_title} ---"
+            else:
+                clean_text = clean_inner
+    except Exception:
+        clean_text = str(msg)
+
     try:
         with open(LOG_FILE, "a", encoding="utf-8") as f:
             f.write(f"[{now_str}] {clean_text}{end}")
@@ -299,6 +331,13 @@ def update_worker_status(last_claim: Optional[Dict[str, Any]] = None):
         proc_exe = sys.executable or "redpacket-claimer.exe"
         proc_name = "redpacket-claimer.exe" if "redpacket" in proc_exe.lower() else os.path.basename(proc_exe)
 
+        is_tg_connected = False
+        try:
+            if "client" in globals() and client:
+                is_tg_connected = bool(client.is_connected())
+        except Exception:
+            pass
+
         status_data.update({
             "status": "running",
             "pid": os.getpid(),
@@ -309,6 +348,7 @@ def update_worker_status(last_claim: Optional[Dict[str, Any]] = None):
             "last_heartbeat_timestamp": now_ts,
             "headless": HEADLESS_MODE,
             "channels": TARGET_CHANNELS,
+            "telegram_connected": is_tg_connected,
             "total_cached_items": len(claimed_items) if "claimed_items" in globals() else 0,
             "queued_held_drops": len(held_drops) if "held_drops" in globals() else 0,
             "lockout_active": is_locked,
@@ -423,7 +463,8 @@ client = TelegramClient(
     'binance_session',
     int(API_ID),
     API_HASH,
-    connection_retries=10,
+    connection=ConnectionTcpIntermediate,
+    connection_retries=5,
     retry_delay=2,
     timeout=20,
     auto_reconnect=True
@@ -676,71 +717,91 @@ async def scan_and_claim_history(channel_entities: List[Any], catchup_limit: int
 @client.on(events.NewMessage(chats=TARGET_CHANNELS))
 async def live_message_handler(event):
     try:
-        chat = await event.get_chat()
-        chat_name = getattr(chat, 'title', getattr(chat, 'username', 'Channel'))
-    except Exception:
-        chat_name = "Channel"
+        try:
+            chat = await event.get_chat()
+            chat_name = getattr(chat, 'title', getattr(chat, 'username', 'Channel'))
+        except Exception:
+            chat_name = "Channel"
 
-    message_text = event.raw_text
-    log_print(Panel(message_text, title=f"[bold green]📩 New Drop from {chat_name}[/bold green]", border_style="green"))
+        message_text = event.raw_text or ""
+        log_print(Panel(message_text, title=f"[bold green]📩 New Drop from {chat_name}[/bold green]", border_style="green"))
 
-    msg_timestamp = time.time()
-    if event.message and event.message.date:
-        msg_timestamp = event.message.date.timestamp()
+        msg_timestamp = time.time()
+        if event.message and event.message.date:
+            msg_timestamp = event.message.date.timestamp()
 
-    parsed = parse_telegram_message(event.message if event.message else message_text)
-    codes = parsed.get("codes", [])
-    square_urls = parsed.get("square_urls", [])
-    red_packet_urls = parsed.get("red_packet_urls", [])
-    answers = parsed.get("answers", [])
+        parsed = parse_telegram_message(event.message if event.message else message_text)
+        codes = parsed.get("codes", [])
+        square_urls = parsed.get("square_urls", [])
+        red_packet_urls = parsed.get("red_packet_urls", [])
+        answers = parsed.get("answers", [])
 
-    if not codes and not square_urls and not red_packet_urls:
-        log_print("[dim][i] Post received, but no red packet codes or reward links found.[/dim]\n")
-        return
+        if not codes and not square_urls and not red_packet_urls:
+            log_print("[dim][i] Post received, but no red packet codes or reward links found.[/dim]\n")
+            return
 
-    # Handle Square Posts
-    if square_urls:
-        if ENABLE_SQUARE_CLAIMS:
-            for sq_url in square_urls:
-                ans = answers[0] if answers else ""
-                await process_single_item("square", sq_url, ans, timestamp=msg_timestamp, channel=chat_name)
-        else:
-            log_print(f"[dim]ℹ️ Binance Square drop detected ({len(square_urls)} post{'s' if len(square_urls)>1 else ''}), but Square claims are disabled (focused on Red Packets). Set ENABLE_SQUARE_CLAIMS=true in .env to enable.[/dim]\n")
+        # Handle Square Posts
+        if square_urls:
+            if ENABLE_SQUARE_CLAIMS:
+                for sq_url in square_urls:
+                    ans = answers[0] if answers else ""
+                    await process_single_item("square", sq_url, ans, timestamp=msg_timestamp, channel=chat_name)
+            else:
+                log_print(f"[dim]ℹ️ Binance Square drop detected ({len(square_urls)} post{'s' if len(square_urls)>1 else ''}), but Square claims are disabled (focused on Red Packets). Set ENABLE_SQUARE_CLAIMS=true in .env to enable.[/dim]\n")
 
-    for code in codes:
-        await process_single_item("code", code, timestamp=msg_timestamp, channel=chat_name)
+        for code in codes:
+            await process_single_item("code", code, timestamp=msg_timestamp, channel=chat_name)
 
-    for rp_url in red_packet_urls:
-        await process_single_item("url", rp_url, timestamp=msg_timestamp, channel=chat_name)
+        for rp_url in red_packet_urls:
+            await process_single_item("url", rp_url, timestamp=msg_timestamp, channel=chat_name)
+
+    except Exception as e:
+        log_print(f"[bold red][!] Error handling live drop: {e}[/bold red]\n")
 
 
 async def keepalive_watchdog():
     """
     Periodically checks MTProto connectivity to Telegram servers.
-    Requires 3 consecutive ping timeouts before triggering reconnect,
-    preventing spurious disconnects during momentary network jitter.
+    Detects if the socket connection was severed (e.g. WinError 64) or pings time out.
+    If disconnected or failing pings consecutively, cleanly forces client disconnect
+    to kick off the supervisor reconnection ladder.
     Also updates worker_status.json heartbeat so background health can be verified.
     """
     from telethon.tl.functions import PingRequest
     consecutive_timeouts = 0
+    consecutive_disconnected = 0
+
     while True:
         try:
-            await asyncio.sleep(25)
+            await asyncio.sleep(20)
             update_worker_status()
-            if client.is_connected():
-                try:
-                    await asyncio.wait_for(client(PingRequest(ping_id=0)), timeout=12.0)
+
+            if not client.is_connected():
+                consecutive_disconnected += 1
+                log_print(f"[dim yellow][!] Telegram client connection lost ({consecutive_disconnected}/2)...[/dim yellow]")
+                if consecutive_disconnected >= 2:
+                    log_print("[bold yellow][!] Telegram connection severed. Triggering reconnection ladder...[/bold yellow]")
+                    consecutive_disconnected = 0
+                    try:
+                        await client.disconnect()
+                    except Exception:
+                        pass
+                continue
+
+            consecutive_disconnected = 0
+            try:
+                await asyncio.wait_for(client(PingRequest(ping_id=0)), timeout=12.0)
+                consecutive_timeouts = 0
+            except (asyncio.TimeoutError, ConnectionError, OSError, Exception) as e:
+                consecutive_timeouts += 1
+                log_print(f"[dim yellow][!] Telegram keepalive ping notice ({consecutive_timeouts}/3): {e}[/dim yellow]")
+                if consecutive_timeouts >= 3:
+                    log_print("[bold yellow][!] 3 consecutive Telegram keepalive pings timed out. Triggering reconnection ladder...[/bold yellow]")
                     consecutive_timeouts = 0
-                except Exception as e:
-                    consecutive_timeouts += 1
-                    log_print(f"[dim yellow][!] Telegram keepalive ping notice ({consecutive_timeouts}/3): {e}[/dim yellow]")
-                    if consecutive_timeouts >= 3:
-                        log_print("[bold yellow][!] 3 consecutive Telegram keepalive pings timed out. Triggering reconnection ladder...[/bold yellow]")
-                        consecutive_timeouts = 0
-                        try:
-                            await client.disconnect()
-                        except Exception:
-                            pass
+                    try:
+                        await client.disconnect()
+                    except Exception:
+                        pass
         except asyncio.CancelledError:
             break
         except Exception:
@@ -758,7 +819,7 @@ async def connect_and_listen(catchup_limit: int = 35):
     while True:
         try:
             if not client.is_connected():
-                console.print(f"\n[bold cyan][+] Connecting to Telegram...[/bold cyan]")
+                log_print(f"\n[bold cyan][+] Connecting to Telegram...[/bold cyan]")
                 if not os.path.exists("binance_session.session"):
                     await client.start(phone=phone_callback)
                 else:
@@ -776,9 +837,9 @@ async def connect_and_listen(catchup_limit: int = 35):
                 user_display = 'Telegram User'
 
             if attempt > 0:
-                console.print(f"[bold green]🌐 [✓] Internet Restored! Reconnected to Telegram as [bold white]{user_display}[/bold white]![/bold green]\n")
+                log_print(f"[bold green]🌐 [✓] Internet Restored! Reconnected to Telegram as [bold white]{user_display}[/bold white]![/bold green]\n")
             else:
-                console.print(f"[bold green][✓] Telegram connected successfully as [bold white]{user_display}[/bold white]![/bold green]\n")
+                log_print(f"[bold green][✓] Telegram connected successfully as [bold white]{user_display}[/bold white]![/bold green]\n")
 
             # Reset backoff attempt counter on successful connection
             attempt = 0
@@ -790,13 +851,13 @@ async def connect_and_listen(catchup_limit: int = 35):
                     entity = await client.get_entity(ch)
                     resolved_entities.append(entity)
                 except Exception as e:
-                    console.print(f"[yellow][!] Notice: Could not resolve channel '{ch}' directly, using raw handle: {e}[/yellow]")
+                    log_print(f"[yellow][!] Notice: Could not resolve channel '{ch}' directly, using raw handle: {e}[/yellow]")
                     resolved_entities.append(ch)
 
             # Catch-up history sweep for fresh drops received during downtime/start
             await scan_and_claim_history(resolved_entities, catchup_limit=catchup_limit)
 
-            console.print(f"[bold gold1]📡 Bot is actively listening for live drops on: {', '.join(TARGET_CHANNELS)}... (Press Ctrl+C to stop)[/bold gold1]\n")
+            log_print(f"[bold gold1]📡 Bot is actively listening for live drops on: {', '.join(TARGET_CHANNELS)}... (Press Ctrl+C to stop)[/bold gold1]\n")
 
             # Start keepalive watchdog task alongside run_until_disconnected
             watchdog_task = asyncio.create_task(keepalive_watchdog())
@@ -809,16 +870,23 @@ async def connect_and_listen(catchup_limit: int = 35):
                 except (asyncio.CancelledError, Exception):
                     pass
 
-            console.print("[bold yellow][!] Telegram connection disconnected.[/bold yellow]")
+            log_print("[bold yellow][!] Telegram connection disconnected.[/bold yellow]")
 
         except asyncio.CancelledError:
-            console.print("[dim yellow][!] Telegram listener interrupted across sleep/power transition. Auto-reconnecting in 3s...[/dim yellow]")
+            log_print("[dim yellow][!] Telegram listener interrupted across sleep/power transition. Auto-reconnecting in 3s...[/dim yellow]")
             await asyncio.sleep(3)
             continue
         except KeyboardInterrupt:
             raise
         except Exception as e:
-            console.print(f"[bold red][!] Telegram connection error: {e}[/bold red]")
+            log_print(f"[bold red][!] Telegram connection error: {e}[/bold red]")
+
+        # Cleanly disconnect any stale socket handles before backoff
+        try:
+            if client.is_connected():
+                await client.disconnect()
+        except Exception:
+            pass
 
         # Disconnection occurred - enter backoff ladder
         delay = get_backoff_delay(attempt)
@@ -826,7 +894,7 @@ async def connect_and_listen(catchup_limit: int = 35):
         attempt_num = attempt + 1
         ladder_summary = "5s → 10s → 20s → 30s → 1m → 3m → 5m → 10m → 20m → 30m"
 
-        console.print(Panel(
+        log_print(Panel(
             f"[bold red]🔌 TELEGRAM DISCONNECTED / UNREACHABLE[/bold red]\n"
             f"[bold white]Internet is disconnected or Telegram servers cannot be reached.[/bold white]\n"
             f"[bold yellow]Retrying in [bold cyan]{delay_formatted}[/bold cyan] (Attempt #{attempt_num}).[/bold yellow]\n"
@@ -843,7 +911,7 @@ async def connect_and_listen(catchup_limit: int = 35):
                         status.update(f"[bold yellow]⏳ Telegram offline. Reconnecting in {format_delay_text(remaining)} (Attempt #{attempt_num})...[/bold yellow]")
                     await asyncio.sleep(1)
         except asyncio.CancelledError:
-            console.print("[dim yellow][!] Sleep/resume event detected during countdown. Re-initiating connection immediately...[/dim yellow]")
+            log_print("[dim yellow][!] Sleep/resume event detected during countdown. Re-initiating connection immediately...[/dim yellow]")
             continue
         except KeyboardInterrupt:
             raise

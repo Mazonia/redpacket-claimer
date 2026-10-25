@@ -478,6 +478,94 @@ class TestClaimTimestampingAndDiagnostics(unittest.TestCase):
         self.assertEqual(format_duration_short(3665), "1h 1m")
 
 
+class TestLogPrintAndNetworkResilience(unittest.TestCase):
+    def setUp(self):
+        self.test_log = os.path.join(os.path.dirname(__file__), "test_log_temp.log")
+        self.test_status = os.path.join(os.path.dirname(__file__), "test_status_temp.json")
+
+    def tearDown(self):
+        for f in [self.test_log, self.test_status]:
+            if os.path.exists(f):
+                try:
+                    os.remove(f)
+                except Exception:
+                    pass
+
+    def test_log_print_supports_rich_panel_and_renderables(self):
+        """Verify log_print handles Rich Panel, Text, and strings without TypeError."""
+        from rich.panel import Panel
+        from rich.text import Text
+        import main
+
+        orig_log = main.LOG_FILE
+        try:
+            main.LOG_FILE = self.test_log
+
+            # 1. Plain string with Rich markup tags
+            main.log_print("[bold green]Hello World[/bold green]")
+
+            # 2. Rich Panel object with title (which previously caused TypeError in re.sub)
+            panel = Panel("BPZ7U1K9QP\nGrab fast!", title="[bold green]📩 New Drop from Cryptobox Parser[/bold green]", border_style="green")
+            main.log_print(panel)
+
+            # 3. Rich Text object
+            text_obj = Text("Custom Text Component")
+            main.log_print(text_obj)
+
+            # 4. Exception object
+            main.log_print(ValueError("Testing error formatting"))
+
+            # Verify contents written to test_log
+            self.assertTrue(os.path.exists(self.test_log))
+            with open(self.test_log, "r", encoding="utf-8") as f:
+                content = f.read()
+
+            self.assertIn("Hello World", content)
+            self.assertNotIn("[bold green]", content)
+            self.assertIn("📩 New Drop from Cryptobox Parser", content)
+            self.assertIn("BPZ7U1K9QP", content)
+            self.assertIn("Custom Text Component", content)
+            self.assertIn("Testing error formatting", content)
+        finally:
+            main.LOG_FILE = orig_log
+
+    def test_update_worker_status_includes_telegram_connected(self):
+        """Verify update_worker_status includes telegram_connected field."""
+        import json
+        import main
+
+        orig_status = main.STATUS_FILE
+        try:
+            main.STATUS_FILE = self.test_status
+            main.update_worker_status()
+
+            self.assertTrue(os.path.exists(self.test_status))
+            with open(self.test_status, "r", encoding="utf-8") as f:
+                sdata = json.load(f)
+
+            self.assertIn("telegram_connected", sdata)
+            self.assertIsInstance(sdata["telegram_connected"], bool)
+        finally:
+            main.STATUS_FILE = orig_status
+
+    def test_live_message_handler_exception_safety(self):
+        """Verify live_message_handler catches all internal errors without raising unhandled exceptions."""
+        import main
+        import asyncio
+
+        mock_event = MagicMock()
+        mock_event.get_chat = AsyncMock(side_effect=Exception("Simulated network timeout"))
+        mock_event.raw_text = "BP12345678"
+        mock_event.message = None
+
+        with patch("main.process_single_item", new_callable=AsyncMock) as mock_process:
+            try:
+                asyncio.run(main.live_message_handler(mock_event))
+                mock_process.assert_awaited()
+            except Exception as e:
+                self.fail(f"live_message_handler raised an unhandled exception: {e}")
+
+
 if __name__ == "__main__":
     unittest.main()
 

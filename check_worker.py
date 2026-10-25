@@ -212,6 +212,15 @@ def show_worker_dashboard():
     ch_text = ", ".join(channels) if channels else "Configured in .env"
     status_panel_text += f"Monitored Channels:[bold magenta] {ch_text}[/bold magenta]\n"
 
+    tg_connected = sdata.get("telegram_connected")
+    if tg_connected is True:
+        tg_status_str = "[bold green]✓ Connected & Actively Listening[/bold green]"
+    elif tg_connected is False and is_running:
+        tg_status_str = "[bold yellow]🔄 Reconnecting / Offline[/bold yellow]"
+    else:
+        tg_status_str = "[dim]Offline[/dim]"
+    status_panel_text += f"Telegram Listener: {tg_status_str}\n"
+
     # Lockout status
     lockout_active = sdata.get("lockout_active", False)
     rem_str = sdata.get("lockout_remaining_str", "")
