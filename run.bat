@@ -5,6 +5,7 @@ cd /d "%~dp0"
 echo ==============================================
 echo       BINANCE RED PACKET AUTO-CLAIMER
 echo ==============================================
+echo [i] Tip: Run 'status.bat' anytime to check worker health and last redeemed code.
 echo.
 
 :: Ensure dedicated named executable exists so Task Manager displays 'redpacket-claimer.exe' instead of generic 'python.exe'

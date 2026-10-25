@@ -120,6 +120,7 @@ python main.py
 ### CLI Command Options:
 | Flag | Description | Example |
 | :--- | :--- | :--- |
+| `--status` | Check live worker state, last code redeemed & channel, autostart health | `python main.py --status` |
 | `--catchup <N>` | Sweep and claim up to `N` recent missed drops from channels (default: `35`) | `python main.py --catchup 35` |
 | `--clear-lockout` | Instantly reset/clear any saved Binance lockout state | `python main.py --clear-lockout` |
 | `--clear-cache` | Clear the claimed codes history cache | `python main.py --clear-cache` |
@@ -137,23 +138,31 @@ python main.py
 
 ---
 
-## ⚡ 24/7 Autostart & Sleep Resilience
+## ⚡ 24/7 Autostart & Health Dashboard
 
-The bot includes an automated triple-layer Windows autostart system that keeps the claimer running permanently:
-- **Survives PC Sleep & Wake**: Uses Windows Event Triggers (`Microsoft-Windows-Power-Troubleshooter` Event 1) to immediately revive or resume claiming the moment your PC wakes up.
-- **Battery-Immune**: Configured with `-AllowStartIfOnBatteries -DontStopIfGoingOnBatteries` so Windows Task Scheduler never cancels or kills the process when your laptop is unplugged or enters standby.
-- **Auto-Restart Supervisor**: `run.bat` runs an infinite resilience loop that relaunches the claimer within 3 seconds if an unexpected exception occurs.
-- **Triple-Layer Redundancy**: Configures Windows Task Scheduler (Layer 1), Windows Startup folder (Layer 2), and Registry Run (Layer 3).
+The bot includes an enterprise-grade Windows autostart system that keeps the claimer running permanently in the background:
+- **Direct Background Service**: Runs `redpacket-claimer.exe` in headless mode directly under Task Scheduler with battery exemption (`-AllowStartIfOnBatteries`) and failure restart (`RestartOnFailure`).
+- **Network Startup Delay (15s)**: Delays startup slightly on boot to ensure Wi-Fi/Ethernet and DNS are online before attempting to connect.
+- **Sleep & Wake Auto-Recovery**: Triggers on `Microsoft-Windows-Power-Troubleshooter` Event 1 to instantly re-check channels when your PC wakes up.
+- **Timestamped Logs**: All claimed drops and worker events are logged with timestamps in `claimer.log` and stored with metadata in `claimed_cache.json`.
+
+### 🔍 Check Worker Status & Last Code Redeemed
+Want to know if the background worker is running and claiming codes?
+- **Quick Check**: Double-click `status.bat` (or run `python main.py --status`).
+- **Dashboard Displays**:
+  - **Worker Status**: Process ID, RAM usage, uptime, and last heartbeat.
+  - **Autostart Status**: Task Scheduler state, last run time, and last exit code.
+  - **Last Code Redeemed Hero Card**: Displays the exact last code claimed, source Telegram channel, timestamp + relative time (e.g., *3m ago*), outcome, and reward amount.
+  - **Recent Claims Table**: Summarizes the last 10 codes processed across all channels.
+  - **Interactive Testing**: Press `[1]` to test-claim a custom code live, `[2]` to stream live logs, or `[3]` to restart the worker.
 
 ### Background Execution & Management:
-- **Run Hidden in Background**: Double-click `start_hidden.vbs` (runs silently in headless mode with instant confirmation popup and duplicate protection).
-- **Stop Background Claimer**: Double-click `stop.bat` (instantly terminates all background claimer processes, supervisors, and browser sessions).
-
-### Enable 24/7 Autostart:
-Double-click `setup_autostart.bat` (accept the UAC prompt).
-
-### Disable 24/7 Autostart:
-Double-click `remove_autostart.bat`.
+- **Check Status / Last Code**: Double-click `status.bat` (or `check_status.bat`).
+- **Run Hidden in Background**: Double-click `start_hidden.vbs` (runs silently in headless mode).
+- **Run in Foreground Console**: Double-click `run.bat`.
+- **Stop Background Claimer**: Double-click `stop.bat` (stops Task Scheduler task and terminates any running instances cleanly).
+- **Enable 24/7 Autostart**: Double-click `setup_autostart.bat` (accept UAC prompt).
+- **Disable 24/7 Autostart**: Double-click `remove_autostart.bat`.
 
 ---
 

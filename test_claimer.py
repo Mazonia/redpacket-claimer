@@ -1,4 +1,5 @@
 import os
+import time
 import unittest
 from unittest.mock import MagicMock, AsyncMock, patch
 
@@ -352,26 +353,28 @@ class TestSingleInstanceProtection(unittest.TestCase):
 
 
 class TestAutostartScripts(unittest.TestCase):
-    def test_setup_autostart_task_scheduler_quoting(self):
-        """Verify setup_autostart.bat does not generate corrupt doubled quotes in Task Scheduler XML."""
+    def test_setup_autostart_task_scheduler_direct_execution(self):
+        """Verify setup_autostart.bat configures direct 24/7 background execution with network delay."""
         setup_bat_path = os.path.join(os.path.dirname(__file__), "setup_autostart.bat")
         with open(setup_bat_path, "r", encoding="utf-8", errors="ignore") as f:
             content = f.read()
 
-        # Check for corrupt doubled quotes in Arguments
-        self.assertNotIn('<Arguments>"`"$vbsPath`" /silent"</Arguments>', content)
-        self.assertIn('<Arguments>"$vbsPath" /silent</Arguments>', content)
+        # Must execute claimer directly with headless flag and boot delay
+        self.assertIn('<Command>$claimerExe</Command>', content)
+        self.assertIn('<Arguments>main.py --headless</Arguments>', content)
+        self.assertIn('<Delay>PT15S</Delay>', content)
+        self.assertIn('Binance-RedPacket-Claimer', content)
 
-    def test_start_hidden_vbs_cmd_quoting_and_lock(self):
-        """Verify start_hidden.vbs includes atomic start.lock and call keyword for spaces safety."""
+    def test_start_hidden_vbs_execution_and_lock(self):
+        """Verify start_hidden.vbs includes atomic start.lock and reliable quoting."""
         vbs_path = os.path.join(os.path.dirname(__file__), "start_hidden.vbs")
         with open(vbs_path, "r", encoding="utf-8", errors="ignore") as f:
             content = f.read()
 
-        # Must use 'call' to protect against CMD outer quote stripping on paths with spaces
-        self.assertIn("cmd.exe /c call", content)
         # Must implement atomic startup lock
         self.assertIn("start.lock", content)
+        # Must support direct executable launch
+        self.assertIn("redpacket-claimer.exe", content)
 
     def test_run_bat_python_fallback(self):
         """Verify run.bat does not crash with infinite loop when python is missing."""
@@ -382,6 +385,97 @@ class TestAutostartScripts(unittest.TestCase):
         # Must have clean error exit if Python not found
         self.assertIn(":no_py", content)
         self.assertIn("exit /b 1", content)
+
+
+class TestClaimTimestampingAndDiagnostics(unittest.TestCase):
+    def setUp(self):
+        self.test_cache = os.path.join(os.path.dirname(__file__), "test_cache_temp.json")
+        self.test_status = os.path.join(os.path.dirname(__file__), "test_status_temp.json")
+
+    def tearDown(self):
+        for f in [self.test_cache, self.test_status]:
+            if os.path.exists(f):
+                try:
+                    os.remove(f)
+                except Exception:
+                    pass
+
+    def test_cache_backward_compatibility(self):
+        """Verify cache loader seamlessly ingests legacy string arrays and modern rich dicts."""
+        import json
+        from main import load_claimed_cache, CACHE_FILE
+        import main
+
+        # Create mixed cache
+        mixed_data = [
+            "LEGACY123",
+            "LEGACY456",
+            {
+                "identifier": "MODERN789",
+                "type": "code",
+                "claimed_at": "2026-10-23 12:00:00",
+                "channel": "Cryptobox Parser",
+                "status": "success"
+            }
+        ]
+        with open(self.test_cache, "w", encoding="utf-8") as f:
+            json.dump(mixed_data, f)
+
+        orig_cache_file = main.CACHE_FILE
+        try:
+            main.CACHE_FILE = self.test_cache
+            loaded = main.load_claimed_cache()
+            self.assertIn("LEGACY123", loaded)
+            self.assertIn("LEGACY456", loaded)
+            self.assertIn("MODERN789", loaded)
+            self.assertEqual(len(loaded), 3)
+            self.assertEqual(main.claimed_details["MODERN789"]["channel"], "Cryptobox Parser")
+        finally:
+            main.CACHE_FILE = orig_cache_file
+
+    def test_record_claimed_item_preserves_metadata(self):
+        """Verify record_claimed_item saves timestamp, channel, and status."""
+        import main
+
+        orig_cache_file = main.CACHE_FILE
+        orig_status_file = main.STATUS_FILE
+        try:
+            main.CACHE_FILE = self.test_cache
+            main.STATUS_FILE = self.test_status
+            main.claimed_items = set()
+            main.claimed_details = {}
+
+            main.record_claimed_item(
+                item_type="code",
+                identifier="TESTCODE1",
+                channel="Crypto VIP Drops",
+                status="success",
+                message="Claimed 0.5 USDT",
+                reward="0.5 USDT"
+            )
+
+            self.assertIn("TESTCODE1", main.claimed_items)
+            detail = main.claimed_details.get("TESTCODE1")
+            self.assertIsNotNone(detail)
+            self.assertEqual(detail["channel"], "Crypto VIP Drops")
+            self.assertEqual(detail["status"], "success")
+            self.assertEqual(detail["reward"], "0.5 USDT")
+            self.assertTrue(bool(detail["claimed_at"]))
+        finally:
+            main.CACHE_FILE = orig_cache_file
+            main.STATUS_FILE = orig_status_file
+
+    def test_check_worker_relative_time(self):
+        """Verify check_worker format_relative_time and duration formatters."""
+        from check_worker import format_relative_time, format_duration_short
+        now = time.time()
+        self.assertEqual(format_relative_time(now - 10), "10s ago")
+        self.assertEqual(format_relative_time(now - 150), "2m ago")
+        self.assertEqual(format_relative_time(now - 7200), "2h 0m ago")
+
+        self.assertEqual(format_duration_short(45), "45s")
+        self.assertEqual(format_duration_short(125), "2m 5s")
+        self.assertEqual(format_duration_short(3665), "1h 1m")
 
 
 if __name__ == "__main__":

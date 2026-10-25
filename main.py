@@ -1,5 +1,6 @@
 import os
 import sys
+import re
 import json
 import time
 import asyncio
@@ -32,9 +33,25 @@ if sys.platform == "win32":
 load_dotenv()
 
 console = Console()
+LOG_FILE = os.path.abspath("./claimer.log")
+STATUS_FILE = os.path.abspath("./worker_status.json")
+
+
+def log_print(msg: str, end: str = "\n"):
+    """Prints to Rich console and appends clean timestamped text to claimer.log."""
+    now_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    clean_text = re.sub(r'\[/?[a-zA-Z0-9_# =,-]+\]', '', msg)
+    try:
+        with open(LOG_FILE, "a", encoding="utf-8") as f:
+            f.write(f"[{now_str}] {clean_text}{end}")
+    except Exception:
+        pass
+    console.print(msg, end=end)
+
 
 def parse_cli_args():
     parser = argparse.ArgumentParser(description="Binance Red Packet & Feed Auto-Claimer")
+    parser.add_argument("--status", action="store_true", help="Display background worker health, last redeemed code, and channel status")
     parser.add_argument("--catchup", type=int, default=35, help="Number of recent channel drops to sweep and claim on startup (default: 35)")
     parser.add_argument("--clear-lockout", action="store_true", help="Clear saved Binance lockout state immediately")
     parser.add_argument("--clear-cache", action="store_true", help="Clear claimed codes cache")
@@ -74,7 +91,7 @@ def ensure_single_claimer_instance():
                 )
 
                 if is_our_claimer:
-                    console.print(f"[dim yellow][!] Terminating previous claimer instance (PID {p.pid})...[/dim yellow]")
+                    log_print(f"[dim yellow][!] Terminating previous claimer instance (PID {p.pid})...[/dim yellow]")
                     # 1. Terminate parent supervisor (e.g. run.bat) first so it cannot resurrect this process
                     try:
                         parent = p.parent() if callable(getattr(p, "parent", None)) else None
@@ -88,7 +105,7 @@ def ensure_single_claimer_instance():
                                     parent.wait(timeout=1.0)
                                 except Exception:
                                     parent.kill()
-                    except Exception:
+                    except (psutil.NoSuchProcess, psutil.AccessDenied, Exception):
                         pass
 
                     # 2. Terminate any lingering child processes (e.g. browser instances)
@@ -98,18 +115,21 @@ def ensure_single_claimer_instance():
                             for child in children:
                                 try:
                                     child.terminate()
-                                except Exception:
+                                except (psutil.NoSuchProcess, psutil.AccessDenied, Exception):
                                     pass
-                    except Exception:
+                    except (psutil.NoSuchProcess, psutil.AccessDenied, Exception):
                         pass
 
                     # 3. Terminate the older claimer process
-                    p.terminate()
                     try:
-                        p.wait(timeout=2.0)
-                    except Exception:
-                        p.kill()
-            except Exception:
+                        p.terminate()
+                        try:
+                            p.wait(timeout=2.0)
+                        except Exception:
+                            p.kill()
+                    except (psutil.NoSuchProcess, psutil.AccessDenied, Exception):
+                        pass
+            except (psutil.NoSuchProcess, psutil.AccessDenied, Exception):
                 pass
     except Exception:
         pass
@@ -125,7 +145,7 @@ ENABLE_SQUARE_CLAIMS = os.getenv("ENABLE_SQUARE_CLAIMS", "false").strip().lower(
 TARGET_CHANNELS = [c.strip() for c in TARGET_CHANNEL_RAW.split(",") if c.strip()]
 
 if not API_ID or not API_HASH or not TARGET_CHANNELS:
-    console.print("[bold red][!] ERROR: TELEGRAM_API_ID, TELEGRAM_API_HASH, and TARGET_CHANNEL must be set in your .env file.[/bold red]")
+    log_print("[bold red][!] ERROR: TELEGRAM_API_ID, TELEGRAM_API_HASH, and TARGET_CHANNEL must be set in your .env file.[/bold red]")
     input("\nPress Enter to exit...")
     exit(1)
 
@@ -156,23 +176,184 @@ def format_delay_text(seconds: int) -> str:
     return f"{minutes} min {rem}s"
 
 
+# Dictionary holding rich metadata for cached items: identifier -> dict
+claimed_details: Dict[str, Dict[str, Any]] = {}
+
+
 def load_claimed_cache() -> Set[str]:
+    """
+    Loads claimed codes cache from disk.
+    Backwards-compatible with:
+    - Legacy list of strings: ["CODE1", "CODE2", ...]
+    - Detailed list of dicts: [{"identifier": "...", "claimed_at": "...", "channel": "..."}, ...]
+    - Dict mapping: {"identifier": {...}}
+    """
+    global claimed_details
+    claimed_set: Set[str] = set()
     if os.path.exists(CACHE_FILE):
         try:
             with open(CACHE_FILE, "r", encoding="utf-8") as f:
                 data = json.load(f)
-                return set(data)
-        except Exception:
-            return set()
-    return set()
+                if isinstance(data, list):
+                    for item in data:
+                        if isinstance(item, str):
+                            code = item.strip()
+                            if code:
+                                claimed_set.add(code)
+                                claimed_details[code] = {
+                                    "identifier": code,
+                                    "type": "code",
+                                    "claimed_at": "Pre-existing cache",
+                                    "timestamp": 0.0,
+                                    "channel": "Pre-existing",
+                                    "status": "claimed",
+                                    "message": ""
+                                }
+                        elif isinstance(item, dict):
+                            ident = (item.get("identifier") or item.get("code") or "").strip()
+                            if ident:
+                                claimed_set.add(ident)
+                                claimed_details[ident] = item
+                elif isinstance(data, dict):
+                    items = data.get("items") or data
+                    for k, v in items.items():
+                        ident = str(k).strip()
+                        if ident:
+                            claimed_set.add(ident)
+                            if isinstance(v, dict):
+                                claimed_details[ident] = v
+                            else:
+                                claimed_details[ident] = {
+                                    "identifier": ident,
+                                    "type": "code",
+                                    "claimed_at": str(v),
+                                    "timestamp": 0.0,
+                                    "channel": "Historical Cache",
+                                    "status": "claimed"
+                                }
+        except Exception as e:
+            log_print(f"[dim yellow][!] Warning loading cache: {e}[/dim yellow]")
+    return claimed_set
 
 
 def save_claimed_cache(cache: Set[str]):
+    """
+    Persists claimed cache to disk with timestamps, source channels, and statuses.
+    Preserves all existing metadata while gracefully supporting legacy entries.
+    """
     try:
+        records = []
+        now_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        for ident in cache:
+            if ident in claimed_details:
+                records.append(claimed_details[ident])
+            else:
+                record = {
+                    "identifier": ident,
+                    "type": "code",
+                    "claimed_at": now_str,
+                    "timestamp": time.time(),
+                    "channel": "History Sweep",
+                    "status": "claimed",
+                    "message": ""
+                }
+                claimed_details[ident] = record
+                records.append(record)
+
         with open(CACHE_FILE, "w", encoding="utf-8") as f:
-            json.dump(list(cache), f, indent=2)
+            json.dump(records, f, indent=2)
     except Exception as e:
-        console.print(f"[dim yellow][!] Warning: Could not save cache: {e}[/dim yellow]")
+        log_print(f"[dim yellow][!] Warning: Could not save cache: {e}[/dim yellow]")
+
+
+def update_worker_status(last_claim: Optional[Dict[str, Any]] = None):
+    """
+    Persists real-time health, process heartbeat, active channels, and last redeemed code
+    to worker_status.json so status.bat and background monitors can inspect worker state anytime.
+    """
+    try:
+        now_ts = time.time()
+        now_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        status_data: Dict[str, Any] = {}
+        if os.path.exists(STATUS_FILE):
+            try:
+                with open(STATUS_FILE, "r", encoding="utf-8") as f:
+                    status_data = json.load(f)
+            except Exception:
+                status_data = {}
+
+        recent = status_data.get("recent_history", [])
+        if last_claim:
+            # Prepend last_claim if not already top
+            if not recent or recent[0].get("identifier") != last_claim.get("identifier"):
+                recent.insert(0, last_claim)
+                recent = recent[:20]
+
+        is_locked, rem_s, rem_str = (False, 0, "")
+        try:
+            if "redeemer" in globals() and redeemer:
+                is_locked, rem_s, rem_str = redeemer.is_locked_out()
+        except Exception:
+            pass
+
+        proc_exe = sys.executable or "redpacket-claimer.exe"
+        proc_name = "redpacket-claimer.exe" if "redpacket" in proc_exe.lower() else os.path.basename(proc_exe)
+
+        status_data.update({
+            "status": "running",
+            "pid": os.getpid(),
+            "process_name": proc_name,
+            "executable": proc_exe,
+            "started_at": status_data.get("started_at", now_str),
+            "last_heartbeat": now_str,
+            "last_heartbeat_timestamp": now_ts,
+            "headless": HEADLESS_MODE,
+            "channels": TARGET_CHANNELS,
+            "total_cached_items": len(claimed_items) if "claimed_items" in globals() else 0,
+            "queued_held_drops": len(held_drops) if "held_drops" in globals() else 0,
+            "lockout_active": is_locked,
+            "lockout_remaining_str": rem_str,
+            "lockout_remaining_seconds": rem_s,
+            "last_code_claimed": last_claim or status_data.get("last_code_claimed"),
+            "recent_history": recent
+        })
+
+        with open(STATUS_FILE, "w", encoding="utf-8") as f:
+            json.dump(status_data, f, indent=2)
+    except Exception:
+        pass
+
+
+def record_claimed_item(
+    item_type: str,
+    identifier: str,
+    channel: str = "Telegram Drop",
+    status: str = "claimed",
+    message: str = "",
+    reward: str = "",
+    timestamp: Optional[float] = None
+):
+    """
+    Records an item as claimed with precise timestamp, source channel, and status.
+    Updates in-memory set, claimed_cache.json, and worker_status.json.
+    """
+    now_ts = timestamp if timestamp is not None else time.time()
+    claimed_at_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+    entry = {
+        "identifier": identifier,
+        "type": item_type,
+        "claimed_at": claimed_at_str,
+        "timestamp": now_ts,
+        "channel": channel or "Telegram Drop",
+        "status": status,
+        "message": message or "",
+        "reward": reward or ""
+    }
+    claimed_items.add(identifier)
+    claimed_details[identifier] = entry
+    save_claimed_cache(claimed_items)
+    update_worker_status(last_claim=entry)
 
 
 def load_held_drops() -> List[Dict[str, Any]]:
@@ -192,13 +373,13 @@ def save_held_drops():
         with open(HELD_DROPS_FILE, "w", encoding="utf-8") as f:
             json.dump(held_drops, f, indent=2)
     except Exception as e:
-        console.print(f"[dim yellow][!] Warning: Could not save held drops cache: {e}[/dim yellow]")
+        log_print(f"[dim yellow][!] Warning: Could not save held drops cache: {e}[/dim yellow]")
 
 
 held_drops: List[Dict[str, Any]] = load_held_drops()
 
 
-def enqueue_held_drop(item_type: str, identifier: str, extra: str = "", timestamp: Optional[float] = None):
+def enqueue_held_drop(item_type: str, identifier: str, extra: str = "", timestamp: Optional[float] = None, channel: str = ""):
     if identifier in claimed_items:
         return
     if any(item.get("identifier") == identifier for item in held_drops):
@@ -209,11 +390,12 @@ def enqueue_held_drop(item_type: str, identifier: str, extra: str = "", timestam
         "type": item_type,
         "identifier": identifier,
         "extra": extra,
-        "timestamp": ts
+        "timestamp": ts,
+        "channel": channel
     }
     held_drops.append(drop)
     save_held_drops()
-    console.print(f"[bold yellow]📥 Held drop queued for auto-redemption post-lockout: {item_type.upper()} '{identifier}'[/bold yellow]")
+    log_print(f"[bold yellow]📥 Held drop queued for auto-redemption post-lockout: {item_type.upper()} '{identifier}' (Channel: {channel or 'Unknown'})[/bold yellow]")
 
 
 def format_phone_number(phone_input: str) -> str:
@@ -250,91 +432,113 @@ redeemer = BinanceRedeemer(headless=HEADLESS_MODE)
 claimed_items: Set[str] = load_claimed_cache()
 
 
-async def process_single_item(item_type: str, identifier: str, extra: str = "", timestamp: Optional[float] = None):
+async def process_single_item(
+    item_type: str,
+    identifier: str,
+    extra: str = "",
+    timestamp: Optional[float] = None,
+    channel: str = "Telegram Drop"
+):
     try:
+        now_ts = time.time()
+        now_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
         if identifier in claimed_items:
-            console.print(f"[dim]↷ Skipping already cached {item_type}: {identifier}[/dim]")
+            log_print(f"[dim][{now_str}] ↷ Skipping already cached {item_type}: {identifier}[/dim]")
             return
 
         # Check if account is on active Binance cooldown
         is_locked, remaining_s, remaining_str = redeemer.is_locked_out()
         if is_locked:
-            console.print(f"[bold red]⏳ Account on Binance Lockout ({remaining_str} remaining). Cannot claim '{identifier}' now — holding in queue.[/bold red]")
-            enqueue_held_drop(item_type, identifier, extra, timestamp=timestamp)
+            log_print(f"[bold red][{now_str}] ⏳ Account on Binance Lockout ({remaining_str} remaining). Cannot claim '{identifier}' now — holding in queue (Channel: {channel}).[/bold red]")
+            enqueue_held_drop(item_type, identifier, extra, timestamp=timestamp, channel=channel)
             return
 
-        ts = timestamp if timestamp is not None else time.time()
+        ts = timestamp if timestamp is not None else now_ts
 
         if item_type == "code":
-            console.print(f"[bold gold1]⚡ Claiming Crypto Box Code: [bold white]{identifier}[/bold white][/bold gold1]")
+            log_print(f"[bold gold1][{now_str}] ⚡ Claiming Crypto Box Code: [bold white]{identifier}[/bold white] (from [bold cyan]{channel}[/bold cyan])[/bold gold1]")
             res = await redeemer.claim_crypto_box_code(identifier)
             status = res.get("status", "")
+            msg = res.get("message", "")
+            reward = res.get("reward", "")
 
-            if status in ["success", "expired", "already_claimed", "invalid"]:
-                claimed_items.add(identifier)
-                save_claimed_cache(claimed_items)
+            claim_time_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+            if status == "success":
+                reward_info = f" | Reward: {reward}" if reward else ""
+                log_print(f"[bold green][{claim_time_str}] 🎉 [SUCCESS] Claimed Crypto Box code '{identifier}' at {claim_time_str}! (Channel: {channel}){reward_info}[/bold green]")
+                record_claimed_item(item_type, identifier, channel=channel, status="success", message=msg, reward=reward, timestamp=time.time())
+                redeemer.clear_lockout()
+            elif status in ["expired", "already_claimed", "invalid"]:
+                status_icon = "❌" if status == "expired" else ("↷" if status == "already_claimed" else "⚠️")
+                log_print(f"[yellow][{claim_time_str}] {status_icon} Code '{identifier}' is {status.upper()} (Claim time: {claim_time_str}, Channel: {channel})[/yellow]")
+                record_claimed_item(item_type, identifier, channel=channel, status=status, message=msg, timestamp=time.time())
                 redeemer.clear_lockout()
             elif status == "rate_limited":
                 rem_str = redeemer.get_lockout_remaining_str()
-                console.print(Panel(
+                log_print(Panel(
                     f"[bold red]🚫 BINANCE RATE LIMIT / LOCKOUT ACTIVATED[/bold red]\n"
-                    f"[bold white]Code '[bold yellow]{identifier}[/bold yellow]' was queued for auto-redemption when lockout expires.[/bold white]\n"
+                    f"[bold white]Code '[bold yellow]{identifier}[/bold yellow]' from [bold cyan]{channel}[/bold cyan] was queued for auto-redemption when lockout expires.[/bold white]\n"
                     f"[bold yellow]Bot is pausing claims for {rem_str} to protect your account.[/bold yellow]",
                     title="[bold red]Rate Limit Alert[/bold red]",
                     border_style="red"
                 ))
-                enqueue_held_drop(item_type, identifier, extra, timestamp=ts)
+                enqueue_held_drop(item_type, identifier, extra, timestamp=ts, channel=channel)
             elif status in ["server_error", "network_timeout"]:
-                console.print(f"[bold yellow][!] Code '{identifier}' hit {status} ({res.get('message')}). Not cached.[/bold yellow]")
+                log_print(f"[bold yellow][{claim_time_str}] [!] Code '{identifier}' hit {status} ({msg}). Not cached.[/bold yellow]")
                 if (time.time() - ts) < MAX_FRESH_CODE_AGE_SECONDS:
-                    console.print(f"[bold cyan]📥 Code '{identifier}' is fresh (< 3m old). Enqueued in held drops to retry when internet stabilizes.[/bold cyan]")
-                    enqueue_held_drop(item_type, identifier, extra, timestamp=ts)
+                    log_print(f"[bold cyan][{claim_time_str}] 📥 Code '{identifier}' is fresh (< 3m old). Enqueued in held drops to retry when internet stabilizes.[/bold cyan]")
+                    enqueue_held_drop(item_type, identifier, extra, timestamp=ts, channel=channel)
             else:
-                console.print(f"[bold yellow][!] Code '{identifier}' returned status '{status}' ({res.get('message')}). Not cached.[/bold yellow]")
+                log_print(f"[bold yellow][{claim_time_str}] [!] Code '{identifier}' returned status '{status}' ({msg}). Not cached.[/bold yellow]")
 
         elif item_type == "square":
-            console.print(f"[bold gold1]⚡ Claiming Binance Square Post: [bold white]{identifier}[/bold white] (Answer: [bold yellow]{extra}[/bold yellow])[/bold gold1]")
+            log_print(f"[bold gold1][{now_str}] ⚡ Claiming Binance Square Post: [bold white]{identifier}[/bold white] (Answer: [bold yellow]{extra}[/bold yellow], Channel: [bold cyan]{channel}[/bold cyan])[/bold gold1]")
             res = await redeemer.claim_binance_square_red_packet(identifier, extra)
             status = res.get("status", "")
+            msg = res.get("message", "")
 
+            claim_time_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
             if status in ["success", "submitted", "opened", "expired", "already_claimed", "invalid"]:
-                claimed_items.add(identifier)
-                save_claimed_cache(claimed_items)
+                log_print(f"[bold green][{claim_time_str}] [✓] Square post '{identifier}' processed ({status}) at {claim_time_str}! (Channel: {channel})[/bold green]")
+                record_claimed_item(item_type, identifier, channel=channel, status=status, message=msg, timestamp=time.time())
                 redeemer.clear_lockout()
             elif status == "rate_limited":
                 rem_str = redeemer.get_lockout_remaining_str()
-                console.print(f"[bold red]🚫 Lockout active ({rem_str} remaining). Square post '{identifier}' held in queue.[/bold red]")
-                enqueue_held_drop(item_type, identifier, extra, timestamp=ts)
+                log_print(f"[bold red][{claim_time_str}] 🚫 Lockout active ({rem_str} remaining). Square post '{identifier}' held in queue.[/bold red]")
+                enqueue_held_drop(item_type, identifier, extra, timestamp=ts, channel=channel)
             elif status in ["server_error", "network_timeout"]:
-                console.print(f"[bold yellow][!] Square post '{identifier}' hit {status}. Not cached.[/bold yellow]")
+                log_print(f"[bold yellow][{claim_time_str}] [!] Square post '{identifier}' hit {status}. Not cached.[/bold yellow]")
                 if (time.time() - ts) < MAX_FRESH_CODE_AGE_SECONDS:
-                    console.print(f"[bold cyan]📥 Square post '{identifier}' is fresh. Enqueued in held drops to retry when internet stabilizes.[/bold cyan]")
-                    enqueue_held_drop(item_type, identifier, extra, timestamp=ts)
+                    log_print(f"[bold cyan][{claim_time_str}] 📥 Square post '{identifier}' is fresh. Enqueued in held drops to retry when internet stabilizes.[/bold cyan]")
+                    enqueue_held_drop(item_type, identifier, extra, timestamp=ts, channel=channel)
             else:
-                console.print(f"[bold yellow][!] Square post '{identifier}' returned '{status}'. Not cached.[/bold yellow]")
+                log_print(f"[bold yellow][{claim_time_str}] [!] Square post '{identifier}' returned '{status}'. Not cached.[/bold yellow]")
 
         elif item_type == "url":
-            console.print(f"[bold gold1]⚡ Opening Red Packet Link: [bold white]{identifier}[/bold white][/bold gold1]")
+            log_print(f"[bold gold1][{now_str}] ⚡ Opening Red Packet Link: [bold white]{identifier}[/bold white] (Channel: [bold cyan]{channel}[/bold cyan])[/bold gold1]")
             res = await redeemer.claim_red_packet_url(identifier)
             status = res.get("status", "")
+            msg = res.get("message", "")
 
+            claim_time_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
             if status in ["success", "opened", "expired", "already_claimed", "invalid"]:
-                claimed_items.add(identifier)
-                save_claimed_cache(claimed_items)
+                log_print(f"[bold green][{claim_time_str}] [✓] Red Packet URL '{identifier}' processed ({status}) at {claim_time_str}! (Channel: {channel})[/bold green]")
+                record_claimed_item(item_type, identifier, channel=channel, status=status, message=msg, timestamp=time.time())
                 redeemer.clear_lockout()
             elif status == "rate_limited":
                 rem_str = redeemer.get_lockout_remaining_str()
-                console.print(f"[bold red]🚫 Lockout active ({rem_str} remaining). Link '{identifier}' held in queue.[/bold red]")
-                enqueue_held_drop(item_type, identifier, extra, timestamp=ts)
+                log_print(f"[bold red][{claim_time_str}] 🚫 Lockout active ({rem_str} remaining). Link '{identifier}' held in queue.[/bold red]")
+                enqueue_held_drop(item_type, identifier, extra, timestamp=ts, channel=channel)
             elif status in ["server_error", "network_timeout"]:
-                console.print(f"[bold yellow][!] Link '{identifier}' hit {status}. Not cached.[/bold yellow]")
+                log_print(f"[bold yellow][{claim_time_str}] [!] Link '{identifier}' hit {status}. Not cached.[/bold yellow]")
                 if (time.time() - ts) < MAX_FRESH_CODE_AGE_SECONDS:
-                    console.print(f"[bold cyan]📥 Link '{identifier}' is fresh. Enqueued in held drops to retry when internet stabilizes.[/bold cyan]")
-                    enqueue_held_drop(item_type, identifier, extra, timestamp=ts)
+                    log_print(f"[bold cyan][{claim_time_str}] 📥 Link '{identifier}' is fresh. Enqueued in held drops to retry when internet stabilizes.[/bold cyan]")
+                    enqueue_held_drop(item_type, identifier, extra, timestamp=ts, channel=channel)
             else:
-                console.print(f"[bold yellow][!] Link '{identifier}' returned '{status}'. Not cached.[/bold yellow]")
+                log_print(f"[bold yellow][{claim_time_str}] [!] Link '{identifier}' returned '{status}'. Not cached.[/bold yellow]")
     except Exception as e:
-        console.print(f"[bold red][!] Error while processing {item_type} '{identifier}': {e}[/bold red]")
+        log_print(f"[bold red][!] Error while processing {item_type} '{identifier}': {e}[/bold red]")
         try:
             await redeemer.ensure_browser_alive()
         except Exception:
@@ -456,16 +660,17 @@ async def scan_and_claim_history(channel_entities: List[Any], catchup_limit: int
 
     # Process catch-up items
     if pending_items:
-        console.print(f"\n[bold cyan]▶ Attempting to redeem {len(pending_items)} missed / recent drops...[/bold cyan]")
+        log_print(f"\n[bold cyan]▶ Attempting to redeem {len(pending_items)} missed / recent drops...[/bold cyan]")
         for item in pending_items:
             is_locked, _, _ = redeemer.is_locked_out()
+            ch_name = item.get("channel", "History Sweep")
             if is_locked:
-                console.print("[bold red]⏳ Cooldown encountered during catch-up sweep. Remaining items placed in held queue.[/bold red]")
-                enqueue_held_drop(item["type"], item["identifier"], item["extra"], timestamp=item["date"].timestamp())
+                log_print("[bold red]⏳ Cooldown encountered during catch-up sweep. Remaining items placed in held queue.[/bold red]")
+                enqueue_held_drop(item["type"], item["identifier"], item["extra"], timestamp=item["date"].timestamp(), channel=ch_name)
                 continue
-            await process_single_item(item["type"], item["identifier"], item["extra"], timestamp=item["date"].timestamp())
+            await process_single_item(item["type"], item["identifier"], item["extra"], timestamp=item["date"].timestamp(), channel=ch_name)
 
-    console.print("\n[bold green][✓] Channel history sweep completed smoothly![/bold green]\n")
+    log_print("\n[bold green][✓] Channel history sweep completed smoothly![/bold green]\n")
 
 
 @client.on(events.NewMessage(chats=TARGET_CHANNELS))
@@ -477,7 +682,7 @@ async def live_message_handler(event):
         chat_name = "Channel"
 
     message_text = event.raw_text
-    console.print(Panel(message_text, title=f"[bold green]📩 New Drop from {chat_name}[/bold green]", border_style="green"))
+    log_print(Panel(message_text, title=f"[bold green]📩 New Drop from {chat_name}[/bold green]", border_style="green"))
 
     msg_timestamp = time.time()
     if event.message and event.message.date:
@@ -490,7 +695,7 @@ async def live_message_handler(event):
     answers = parsed.get("answers", [])
 
     if not codes and not square_urls and not red_packet_urls:
-        console.print("[dim][i] Post received, but no red packet codes or reward links found.[/dim]\n")
+        log_print("[dim][i] Post received, but no red packet codes or reward links found.[/dim]\n")
         return
 
     # Handle Square Posts
@@ -498,15 +703,15 @@ async def live_message_handler(event):
         if ENABLE_SQUARE_CLAIMS:
             for sq_url in square_urls:
                 ans = answers[0] if answers else ""
-                await process_single_item("square", sq_url, ans, timestamp=msg_timestamp)
+                await process_single_item("square", sq_url, ans, timestamp=msg_timestamp, channel=chat_name)
         else:
-            console.print(f"[dim]ℹ️ Binance Square drop detected ({len(square_urls)} post{'s' if len(square_urls)>1 else ''}), but Square claims are disabled (focused on Red Packets). Set ENABLE_SQUARE_CLAIMS=true in .env to enable.[/dim]\n")
+            log_print(f"[dim]ℹ️ Binance Square drop detected ({len(square_urls)} post{'s' if len(square_urls)>1 else ''}), but Square claims are disabled (focused on Red Packets). Set ENABLE_SQUARE_CLAIMS=true in .env to enable.[/dim]\n")
 
     for code in codes:
-        await process_single_item("code", code, timestamp=msg_timestamp)
+        await process_single_item("code", code, timestamp=msg_timestamp, channel=chat_name)
 
     for rp_url in red_packet_urls:
-        await process_single_item("url", rp_url, timestamp=msg_timestamp)
+        await process_single_item("url", rp_url, timestamp=msg_timestamp, channel=chat_name)
 
 
 async def keepalive_watchdog():
@@ -514,21 +719,23 @@ async def keepalive_watchdog():
     Periodically checks MTProto connectivity to Telegram servers.
     Requires 3 consecutive ping timeouts before triggering reconnect,
     preventing spurious disconnects during momentary network jitter.
+    Also updates worker_status.json heartbeat so background health can be verified.
     """
     from telethon.tl.functions import PingRequest
     consecutive_timeouts = 0
     while True:
         try:
             await asyncio.sleep(25)
+            update_worker_status()
             if client.is_connected():
                 try:
                     await asyncio.wait_for(client(PingRequest(ping_id=0)), timeout=12.0)
                     consecutive_timeouts = 0
                 except Exception as e:
                     consecutive_timeouts += 1
-                    console.print(f"[dim yellow][!] Telegram keepalive ping notice ({consecutive_timeouts}/3): {e}[/dim yellow]")
+                    log_print(f"[dim yellow][!] Telegram keepalive ping notice ({consecutive_timeouts}/3): {e}[/dim yellow]")
                     if consecutive_timeouts >= 3:
-                        console.print("[bold yellow][!] 3 consecutive Telegram keepalive pings timed out. Triggering reconnection ladder...[/bold yellow]")
+                        log_print("[bold yellow][!] 3 consecutive Telegram keepalive pings timed out. Triggering reconnection ladder...[/bold yellow]")
                         consecutive_timeouts = 0
                         try:
                             await client.disconnect()
@@ -694,24 +901,33 @@ async def lockout_queue_monitor():
                     save_claimed_cache(claimed_items)
                     continue
 
-                console.print(f"[bold cyan]⚡ Auto-entering held drop ({int(age)}s old): [bold white]{identifier}[/bold white][/bold cyan]")
-                await process_single_item(item_type, identifier, extra, timestamp=ts)
+                log_print(f"[bold cyan]⚡ Auto-entering held drop ({int(age)}s old): [bold white]{identifier}[/bold white] (Channel: {item.get('channel', 'Held Drop')})[/bold cyan]")
+                await process_single_item(item_type, identifier, extra, timestamp=ts, channel=item.get("channel", "Held Drop"))
 
                 # If processing this drop triggered lockout again, pause remaining
                 is_locked_now, _, rem_str_now = redeemer.is_locked_out()
                 if is_locked_now:
-                    console.print(f"[bold red]⏳ Re-entered Binance lockout ({rem_str_now} remaining). Remaining held drops will stay queued.[/bold red]")
+                    log_print(f"[bold red]⏳ Re-entered Binance lockout ({rem_str_now} remaining). Remaining held drops will stay queued.[/bold red]")
                     break
 
         except asyncio.CancelledError:
             break
         except Exception as e:
-            console.print(f"[dim yellow][!] Notice in lockout queue monitor: {e}[/dim yellow]")
+            log_print(f"[dim yellow][!] Notice in lockout queue monitor: {e}[/dim yellow]")
             await asyncio.sleep(5)
 
 
 async def main():
     cli_args = parse_cli_args()
+
+    if getattr(cli_args, "status", False):
+        try:
+            from check_worker import show_worker_dashboard
+            show_worker_dashboard()
+            return
+        except Exception as e:
+            console.print(f"[bold red]Error running status check: {e}[/bold red]")
+            return
 
     global HEADLESS_MODE, ENABLE_SQUARE_CLAIMS
     if cli_args.headless:
@@ -728,12 +944,15 @@ async def main():
 
     if cli_args.clear_lockout:
         redeemer.clear_lockout()
-        console.print("[bold green][✓] Manually cleared Binance lockout state on startup.[/bold green]")
+        log_print("[bold green][✓] Manually cleared Binance lockout state on startup.[/bold green]")
 
     if cli_args.clear_cache:
         claimed_items.clear()
         save_claimed_cache(claimed_items)
-        console.print("[bold green][✓] Cleared claimed codes cache.[/bold green]")
+        log_print("[bold green][✓] Cleared claimed codes cache.[/bold green]")
+
+    # Publish startup health to worker_status.json
+    update_worker_status()
 
     is_locked, remaining_s, remaining_str = redeemer.is_locked_out()
     lockout_status = f"[bold red]Active ({remaining_str} remaining)[/bold red]" if is_locked else "[bold green]Clear (Ready to Claim)[/bold green]"
@@ -755,7 +974,7 @@ async def main():
     console.print(table)
 
     if is_locked:
-        console.print(Panel(
+        log_print(Panel(
             f"[bold red]⚠️ ACTIVE BINANCE RATE LIMIT DETECTED[/bold red]\n"
             f"[bold white]Your Binance account is on cooldown ({remaining_str} remaining).[/bold white]\n"
             f"[bold yellow]The bot is running in stealth listener mode. Drops will be queued and auto-redeemed once lockout expires.[/bold yellow]\n"
@@ -775,8 +994,8 @@ async def main():
             except KeyboardInterrupt:
                 raise
             except Exception as e:
-                console.print(f"\n[bold red][!] Main listener encountered error: {e}[/bold red]")
-                console.print("[bold yellow]🔄 Restarting listener in 5s...[/bold yellow]")
+                log_print(f"\n[bold red][!] Main listener encountered error: {e}[/bold red]")
+                log_print("[bold yellow]🔄 Restarting listener in 5s...[/bold yellow]")
                 await asyncio.sleep(5)
     finally:
         lockout_task.cancel()
@@ -793,6 +1012,15 @@ async def main():
             await redeemer.close()
         except Exception:
             pass
+        try:
+            if os.path.exists(STATUS_FILE):
+                with open(STATUS_FILE, "r", encoding="utf-8") as f:
+                    sdata = json.load(f)
+                sdata["status"] = "stopped"
+                with open(STATUS_FILE, "w", encoding="utf-8") as f:
+                    json.dump(sdata, f, indent=2)
+        except Exception:
+            pass
 
 
 if __name__ == "__main__":
@@ -800,10 +1028,10 @@ if __name__ == "__main__":
     try:
         asyncio.run(main())
     except KeyboardInterrupt:
-        console.print("\n[bold yellow][!] Bot stopped by user.[/bold yellow]")
+        log_print("\n[bold yellow][!] Bot stopped by user.[/bold yellow]")
         sys.exit(0)
     except Exception as e:
-        console.print(f"\n[bold red][!] Unhandled Error: {e}[/bold red]")
+        log_print(f"\n[bold red][!] Unhandled Error: {e}[/bold red]")
         import traceback
         traceback.print_exc()
         if sys.stdin and hasattr(sys.stdin, "isatty") and sys.stdin.isatty():

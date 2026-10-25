@@ -87,16 +87,30 @@ If bAlreadyRunning Then
     FSO.DeleteFile strLockFile, True
     On Error GoTo 0
     If Not bSilent Then
-        WshShell.Popup "Binance Red Packet Claimer is already running in the background." & vbCrLf & vbCrLf & "Use stop.bat to stop it if needed.", 4, "Claimer Already Running", 64
+        WshShell.Popup "Binance Red Packet Claimer is already running in the background." & vbCrLf & vbCrLf & "Use status.bat to check worker health & last redeemed code." & vbCrLf & "Use stop.bat to stop it.", 4, "Claimer Already Running", 64
     End If
     WScript.Quit 0
 End If
 
-' 3. Launch run.bat completely hidden (0 = SW_HIDE, False = async)
-' Using "cmd.exe /c call ..." prevents Windows CMD from stripping outer quotes when strCurDir contains spaces
-WshShell.Run "cmd.exe /c call """ & strCurDir & "\run.bat"" " & strArgs, 0, False
+' 3. Launch claimer directly hidden (0 = SW_HIDE, False = async)
+strExe = strCurDir & "\redpacket-claimer.exe"
+If FSO.FileExists(strExe) Then
+    strLaunchCmd = """" & strExe & """ main.py " & strArgs
+Else
+    strLaunchCmd = "cmd.exe /c call """ & strCurDir & "\run.bat"" " & strArgs
+End If
 
-' Give run.bat a brief moment to spawn before releasing startup lock
+On Error Resume Next
+Set objLog = FSO.OpenTextFile(strCurDir & "\launcher.log", 8, True)
+If Err.Number = 0 Then
+    objLog.WriteLine "[" & Now & "] Launching: " & strLaunchCmd
+    objLog.Close
+End If
+On Error GoTo 0
+
+WshShell.Run strLaunchCmd, 0, False
+
+' Give claimer a brief moment to spawn before releasing startup lock
 WScript.Sleep 1500
 
 On Error Resume Next
@@ -105,5 +119,5 @@ FSO.DeleteFile strLockFile, True
 On Error GoTo 0
 
 If Not bSilent Then
-    WshShell.Popup "Binance Red Packet Auto-Claimer started in background (Headless Mode)." & vbCrLf & vbCrLf & "To stop: run stop.bat" & vbCrLf & "To monitor: view claimed_cache.json", 3, "Claimer Started", 64
+    WshShell.Popup "Binance Red Packet Auto-Claimer started in background (Headless Mode)." & vbCrLf & vbCrLf & "To check status & last claimed code: run status.bat" & vbCrLf & "To stop: run stop.bat", 4, "Claimer Started", 64
 End If

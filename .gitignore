@@ -35,3 +35,6 @@ Thumbs.db
 
 *.exe
 held_drops.json
+
+*.log
+worker_status.json
