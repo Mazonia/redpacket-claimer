@@ -302,6 +302,10 @@ class BinanceRedeemer:
         try:
             # 1. Look for close / dismiss buttons
             close_selectors = [
+                '.bn-modal-wrap [aria-label="Close"]',
+                '[aria-label="Close"]',
+                'div[role="button"][aria-label="Close"]',
+                '.bn-modal-header-next',
                 '.openbox button',
                 '.openbox [class*="close"]',
                 '.openbox svg',
@@ -329,9 +333,20 @@ class BinanceRedeemer:
             await self.page.keyboard.press("Escape")
             await asyncio.sleep(0.2)
 
-            # 3. If modal, mask, or toast is still present in DOM, forcefully remove it so it cannot block clicks or pollute feedback
+            # 3. Dismiss cookie preferences banner if visible
+            try:
+                await self.page.evaluate("""() => {
+                    const cookieBtn = document.querySelector('#accept-recommended-btn-handler');
+                    if (cookieBtn && cookieBtn.offsetWidth > 0) {
+                        cookieBtn.click();
+                    }
+                }""")
+            except Exception:
+                pass
+
+            # 4. If modal, mask, or toast is still present in DOM, forcefully remove it so it cannot block clicks or pollute feedback
             await self.page.evaluate("""() => {
-                const lingering = document.querySelectorAll('.bn-mask, .bn-modal, .openbox, [role="presentation"].bn-mask, .toast, .bn-toast, .bn-feedback');
+                const lingering = document.querySelectorAll('.bn-mask, .bn-modal, .bn-modal-wrap, .bn-modal-mask, .openbox, [role="presentation"].bn-mask, .toast, .bn-toast, .bn-feedback');
                 lingering.forEach(el => el.remove());
             }""")
             await asyncio.sleep(0.2)
@@ -524,7 +539,19 @@ class BinanceRedeemer:
         if await self._is_error_page():
             await self._recover_from_error(CRYPTO_BOX_URL)
 
+        # Accept cookie preferences if blocking UI
+        try:
+            await self.page.evaluate("""() => {
+                const cookieBtn = document.querySelector('#accept-recommended-btn-handler');
+                if (cookieBtn && cookieBtn.offsetWidth > 0) {
+                    cookieBtn.click();
+                }
+            }""")
+        except Exception:
+            pass
+
         input_selectors = [
+            'input[placeholder*="red packet code" i]',
             'input[placeholder*="Red Packet" i]',
             'input[placeholder*="Crypto Box" i]',
             'input[placeholder*="code" i]',
@@ -564,7 +591,7 @@ class BinanceRedeemer:
         """
         Examines inline form error messages, dialogs, modals, toasts, and DOM text
         to accurately classify the result of a redemption attempt.
-        Filters out page chrome, headers, footers, and language/currency noise (e.g. 'English English USD-$').
+        Filters out page chrome, headers, footers, cookie consent dialogs, and language/currency noise.
         """
         if not self.page:
             return {"status": "no_page", "message": "No active browser page"}
@@ -581,15 +608,17 @@ class BinanceRedeemer:
                            (el.offsetWidth > 0 || el.offsetHeight > 0 || el.getClientRects().length > 0);
                 };
 
-                const isInsideHeaderOrNav = (el) => {
+                const isInsideExcluded = (el) => {
                     let cur = el;
                     while (cur && cur !== document.body) {
                         const tag = (cur.tagName || '').toLowerCase();
                         const cls = (cur.className || '').toString().toLowerCase();
                         const role = (cur.getAttribute('role') || '').toLowerCase();
+                        const id = (cur.id || '').toLowerCase();
                         if (tag === 'header' || tag === 'nav' || tag === 'footer' || 
                             cls.includes('header') || cls.includes('navbar') || cls.includes('footer') ||
-                            role === 'navigation') {
+                            role === 'navigation' ||
+                            id.includes('onetrust') || cls.includes('ot-sdk') || cls.includes('onetrust')) {
                             return true;
                         }
                         cur = cur.parentElement;
@@ -605,7 +634,7 @@ class BinanceRedeemer:
                     return words.every(w => IGNORED_WORDS.includes(w) || !isNaN(w));
                 };
 
-                // 1. Check known feedback / form error selector containers (excluding header/nav/footer)
+                // 1. Check known feedback / form error selector containers (excluding header/nav/footer/onetrust)
                 const selectors = [
                     '.bn-form-item-explain',
                     '.bn-form-item-error',
@@ -624,7 +653,7 @@ class BinanceRedeemer:
                     try {
                         const elements = document.querySelectorAll(sel);
                         elements.forEach(el => {
-                            if (isVisible(el) && !isInsideHeaderOrNav(el) && el.innerText && el.innerText.trim()) {
+                            if (isVisible(el) && !isInsideExcluded(el) && el.innerText && el.innerText.trim()) {
                                 const clean = el.innerText.trim();
                                 if (!isNoise(clean)) {
                                     texts.push(clean);
@@ -635,11 +664,11 @@ class BinanceRedeemer:
                 }
 
                 // 2. Check input container and its parents (captures inline form validation errors)
-                const input = document.querySelector('input[type="text"], input[name="code"], input[placeholder*="code" i], input[placeholder*="Crypto" i]');
+                const input = document.querySelector('input[type="text"], input[name="code"], input[placeholder*="code" i], input[placeholder*="Crypto" i], input[placeholder*="red packet" i]');
                 if (input) {
                     let parent = input.parentElement;
                     for (let i = 0; i < 5 && parent; i++) {
-                        if (isVisible(parent) && !isInsideHeaderOrNav(parent)) {
+                        if (isVisible(parent) && !isInsideExcluded(parent)) {
                             const pText = (parent.innerText || '').trim();
                             if (pText && (
                                 pText.includes('exceeded') || 
@@ -723,6 +752,7 @@ class BinanceRedeemer:
         if (
             "already claimed" in text_lower or
             "claimed it already" in text_lower or
+            "already redeemed" in text_lower or
             "cannot claim twice" in text_lower or
             "you have already" in text_lower
         ):
@@ -744,12 +774,14 @@ class BinanceRedeemer:
                 "message": "Invalid code"
             }
 
-        # 5. Server Error
+        # 5. Server Error (require explicit error/server context, not bare '500')
         if (
             "something went wrong" in text_lower or
-            "500" in text_lower or
             "internal server error" in text_lower or
-            "service unavailable" in text_lower
+            "service unavailable" in text_lower or
+            "502 bad gateway" in text_lower or
+            "504 gateway" in text_lower or
+            (bool(re.search(r'\b500\b', text_lower)) and any(w in text_lower for w in ["server", "error", "gateway", "internal", "service"]))
         ):
             return {
                 "status": "server_error",
@@ -773,10 +805,11 @@ class BinanceRedeemer:
         """
         Intelligently awaits the outcome of clicking 'Claim' over unstable/slow internet.
         Polls actively up to timeout_seconds:
-        1. Checks for 'Open' button (packet ready to open).
-        2. Checks for genuine Binance feedback (expired, claimed, invalid, rate limited).
-        3. Checks for 500 error / offline page.
-        4. Detects in-flight / loading spinner states and continues waiting.
+        1. Checks for 'Open' button (envelope packet ready to open).
+        2. Checks for 'Red Packet Details' modal (instant reward / already opened).
+        3. Checks for genuine Crypto Box feedback (expired, claimed, invalid, rate limited).
+        4. Checks for 500 error / offline page.
+        5. Detects in-flight / loading spinner states and continues waiting.
         """
         start_time = time.time()
         open_selectors = [
@@ -792,7 +825,7 @@ class BinanceRedeemer:
             if await self._is_error_page():
                 return {"status": "server_error", "message": "Binance Error Screen detected"}
 
-            # 2. Check for "Open" modal button (valid un-claimed packet)
+            # 2. Check for "Open" modal button (valid un-claimed packet envelope)
             for o_sel in open_selectors:
                 try:
                     open_btn = await self.page.query_selector(o_sel)
@@ -801,29 +834,84 @@ class BinanceRedeemer:
                             await open_btn.click(timeout=2500)
                         except Exception:
                             await open_btn.click(timeout=2000, force=True)
-                        await self._human_delay(1.2, 2.0)
-                        console.print(f"[bold gold1]🎉 [SUCCESS] Successfully opened Red Packet '{code}'![/bold gold1]")
-                        return {"status": "success", "message": "Red Packet opened"}
+                        await self._human_delay(1.0, 1.8)
+
+                        # Try to capture reward from subsequent details modal
+                        reward = ""
+                        try:
+                            modal_text = await self.page.evaluate("""() => {
+                                const m = document.querySelector('.bn-modal-wrap');
+                                return m ? (m.innerText || '') : '';
+                            }""")
+                            for line in (modal_text or "").split("\n"):
+                                m = re.match(r"^([0-9]+(?:\.[0-9]+)?)\s*([A-Za-z]{2,10})$", line.strip())
+                                if m:
+                                    reward = f"{m.group(1)} {m.group(2)}"
+                                    break
+                        except Exception:
+                            pass
+
+                        reward_msg = f" ({reward})" if reward else ""
+                        console.print(f"[bold gold1]🎉 [SUCCESS] Successfully opened Red Packet '{code}'{reward_msg}![/bold gold1]")
+                        return {"status": "success", "message": "Red Packet opened", "reward": reward}
                 except Exception:
                     pass
 
-            # 3. Check for genuine Crypto Box feedback
+            # 3. Check for "Red Packet Details" modal (instantly opened or already claimed details)
+            try:
+                details_info = await self.page.evaluate("""() => {
+                    const m = document.querySelector('.bn-modal-wrap');
+                    if (!m) return null;
+                    const text = m.innerText || '';
+                    if (text.includes('Red Packet Details') || text.includes('Crypto has been sent') || text.includes('Spot Account')) {
+                        return { found: true, text };
+                    }
+                    return null;
+                }""")
+                if details_info and details_info.get("found"):
+                    modal_text = details_info.get("text", "")
+                    reward = ""
+                    # Give it up to 1.5s to hydrate reward amount if detail is loading
+                    for _ in range(6):
+                        for line in (modal_text or "").split("\n"):
+                            clean_line = line.strip()
+                            if "opened" in clean_line or "claimed" in clean_line:
+                                continue
+                            m = re.search(r"^(\d+(?:\.\d+)?)\s+([A-Za-z]{2,10})$", clean_line)
+                            if m:
+                                reward = f"{m.group(1)} {m.group(2)}"
+                                break
+                        if reward:
+                            break
+                        await asyncio.sleep(0.25)
+                        try:
+                            modal_text = await self.page.evaluate("() => document.querySelector('.bn-modal-wrap') ? document.querySelector('.bn-modal-wrap').innerText : ''")
+                        except Exception:
+                            break
+
+                    reward_msg = f" ({reward})" if reward else ""
+                    console.print(f"[bold gold1]🎉 [SUCCESS] Successfully claimed Red Packet '{code}'{reward_msg}![/bold gold1]")
+                    return {"status": "success", "message": "Red Packet opened", "reward": reward}
+            except Exception:
+                pass
+
+            # 4. Check for genuine Crypto Box feedback
             fb = await self._extract_page_feedback()
             status = fb.get("status", "unknown")
 
             if status in ["rate_limited", "expired", "already_claimed", "invalid", "server_error"]:
                 return fb
 
-            # 4. Check if claim button is still in a loading / spinning / disabled state
+            # 5. Check if claim button is ACTUALLY in a loading spinner state (NOT just aria-disabled)
             is_loading = False
             try:
                 is_loading = await self.page.evaluate("""() => {
                     const claimBtn = document.querySelector('button[type="submit"]') ||
                                      Array.from(document.querySelectorAll('button')).find(b => (b.innerText || '').includes('Claim'));
                     if (!claimBtn) return false;
-                    const hasSpin = claimBtn.querySelector('svg, .bn-loading, [class*="spin" i], [class*="loading" i]');
-                    const isDisabled = claimBtn.disabled || claimBtn.getAttribute('aria-disabled') === 'true' || claimBtn.classList.contains('is-loading');
-                    return !!(hasSpin || isDisabled);
+                    const hasSpin = claimBtn.querySelector('svg.bn-loading, [class*="spin" i], [class*="loading" i]');
+                    const isPageLoading = document.querySelector('.bn-loading');
+                    return !!(hasSpin || claimBtn.classList.contains('is-loading') || isPageLoading);
                 }""")
             except Exception:
                 pass
@@ -833,7 +921,7 @@ class BinanceRedeemer:
                 await asyncio.sleep(0.35)
                 continue
 
-            # 5. If feedback is unknown with text, give it a moment to stabilize
+            # 6. If feedback is unknown with text, give it a moment to stabilize
             if status == "unknown" and fb.get("message") and (time.time() - start_time >= 3.0):
                 return fb
 
@@ -981,10 +1069,12 @@ class BinanceRedeemer:
                     outcome = await self._wait_for_claim_outcome(code, timeout_seconds=12.0)
                     status = outcome.get("status", "unknown")
                     fb_msg = outcome.get("message", "")
+                    reward = outcome.get("reward", "")
 
                     if status == "success":
                         result["status"] = "success"
-                        result["message"] = "Red Packet opened"
+                        result["message"] = fb_msg or "Red Packet opened"
+                        result["reward"] = reward
                         self.clear_lockout()
                         self._reset_circuit_breaker()
                         await self._dismiss_modals()
@@ -1017,6 +1107,7 @@ class BinanceRedeemer:
                         console.print(f"[yellow][i] You have already claimed code '{code}'.[/yellow]")
                         result["status"] = "already_claimed"
                         result["message"] = "Already claimed"
+                        result["reward"] = reward
                         await self._dismiss_modals()
                         await self._human_delay(1.0, 2.0)
                         return result
@@ -1037,7 +1128,6 @@ class BinanceRedeemer:
                         if await self._is_error_page():
                             await self._recover_from_error(CRYPTO_BOX_URL)
                         if attempt < max_attempts:
-                            console.print(f"[bold cyan]🔄 Retrying code '{code}' after error recovery (Attempt {attempt + 1}/{max_attempts})...[/bold cyan]")
                             await asyncio.sleep(2.0)
                             continue
                         await self._dismiss_modals()
@@ -1050,7 +1140,6 @@ class BinanceRedeemer:
                         if await self._is_error_page():
                             await self._recover_from_error(CRYPTO_BOX_URL)
                         if attempt < max_attempts:
-                            console.print(f"[bold cyan]🔄 Retrying code '{code}' (Attempt {attempt + 1}/{max_attempts})...[/bold cyan]")
                             await asyncio.sleep(2.0)
                             continue
                         await self._dismiss_modals()
@@ -1061,7 +1150,6 @@ class BinanceRedeemer:
                         result["status"] = "unknown"
                         result["message"] = fb_msg or "Unknown response"
                         if attempt < max_attempts:
-                            console.print(f"[bold cyan]🔄 Retrying code '{code}' (Attempt {attempt + 1}/{max_attempts})...[/bold cyan]")
                             await self._dismiss_modals()
                             await asyncio.sleep(2.0)
                             continue

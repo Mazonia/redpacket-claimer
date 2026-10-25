@@ -228,6 +228,36 @@ class TestPageFeedbackNoiseFiltering(unittest.IsolatedAsyncioTestCase):
         outcome = await redeemer._wait_for_claim_outcome("TESTCODE", timeout_seconds=1.0)
         self.assertEqual(outcome.get("status"), "server_error")
 
+    async def test_wait_for_claim_outcome_details_modal_success(self):
+        redeemer = BinanceRedeemer(headless=True)
+        mock_page = AsyncMock()
+        mock_page.url = "https://www.binance.com/en/my/wallet/account/payment/cryptobox"
+        mock_page.query_selector.return_value = None
+
+        async def mock_eval(script):
+            if "Red Packet Details" in script or "Crypto has been sent" in script:
+                return {"found": True, "text": "Red Packet Details\n0.00013514 USTC\nCrypto has been sent to your Spot Account.", "reward": "0.00013514 USTC"}
+            return ""
+
+        mock_page.evaluate = mock_eval
+        redeemer.page = mock_page
+
+        outcome = await redeemer._wait_for_claim_outcome("TESTCODE", timeout_seconds=2.0)
+        self.assertEqual(outcome.get("status"), "success")
+        self.assertEqual(outcome.get("reward"), "0.00013514 USTC")
+
+    async def test_extract_page_feedback_no_false_server_error(self):
+        redeemer = BinanceRedeemer(headless=True)
+        mock_page = AsyncMock()
+        mock_page.url = "https://www.binance.com/en/my/wallet/account/payment/cryptobox"
+        # Text containing "500" as a number or cookie ID, but NOT an error
+        mock_page.evaluate.return_value = "Claim limit: 500 packets remaining in campaign"
+        redeemer.page = mock_page
+
+        fb = await redeemer._extract_page_feedback()
+        self.assertNotEqual(fb.get("status"), "server_error")
+
+
 
 class TestMainNetworkManagement(unittest.TestCase):
     def test_backoff_delays(self):
