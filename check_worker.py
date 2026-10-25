@@ -66,7 +66,13 @@ def get_active_claimer_process() -> Tuple[bool, Optional[int], Optional[str], Op
                     if p.is_running():
                         p_name = p.name().lower()
                         cmdline = " ".join(p.cmdline() or []).lower()
-                        if "redpacket" in p_name or ("main.py" in cmdline and cur_dir in cmdline):
+                        p_cwd = ""
+                        try:
+                            p_cwd = (p.cwd() or "").lower()
+                        except Exception:
+                            pass
+                        in_dir = (cur_dir in cmdline) or (cur_dir == p_cwd)
+                        if "redpacket" in p_name or ("main.py" in cmdline and in_dir):
                             uptime = time.time() - p.create_time()
                             return True, p.pid, p.name(), uptime
             except Exception:
@@ -79,10 +85,16 @@ def get_active_claimer_process() -> Tuple[bool, Optional[int], Optional[str], Op
                     continue
                 p_name = p.info.get('name', '').lower()
                 cmdline = " ".join(p.info.get('cmdline') or []).lower()
-                if "redpacket-claimer.exe" in p_name and cur_dir in cmdline:
+                p_cwd = ""
+                try:
+                    p_cwd = (p.cwd() or "").lower()
+                except Exception:
+                    pass
+                in_dir = (cur_dir in cmdline) or (cur_dir == p_cwd)
+                if "redpacket-claimer.exe" in p_name and in_dir:
                     uptime = time.time() - (p.info.get('create_time') or time.time())
                     return True, p.pid, p.info.get('name'), uptime
-                if ("python.exe" in p_name or "pythonw.exe" in p_name) and "main.py" in cmdline and cur_dir in cmdline:
+                if ("python.exe" in p_name or "pythonw.exe" in p_name) and "main.py" in cmdline and in_dir:
                     uptime = time.time() - (p.info.get('create_time') or time.time())
                     return True, p.pid, p.info.get('name'), uptime
             except (psutil.NoSuchProcess, psutil.AccessDenied, Exception):
