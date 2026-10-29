@@ -1,0 +1,44 @@
+# Binance Red Packet & Square Comment-to-Earn Auto-Claimer
+
+> Real-time Telegram channel monitor and automated redeemer for Binance Crypto Box (Red Packet) drop codes and Binance Square Comment-to-Earn reward posts using Telethon and Playwright.
+
+## Project Overview
+- **Name:** Binance Auto-Claimer (Red Packet & Square)
+- **Repository:** https://github.com/Mazonia/redpacket-claimer
+- **License:** MIT
+- **Runtime:** Python 3.10+
+- **Core Dependencies:** `telethon`, `playwright`, `rich`, `pydantic`
+
+## Key Capabilities
+- **Real-Time Telegram Monitoring:** Telethon MTProto listener tracks drop channels and instant message groups for Crypto Box codes.
+- **Automated Crypto Box Redemption:** Playwright automation inputs codes onto `binance.com/cryptobox`, clicks Claim, and opens the reward box.
+- **Binance Square Comment-to-Earn:** Detects Binance Feed / Square posts, extracts answers enclosed in special symbols, fills the answer box, and submits.
+- **Anti-Ban Protection & Cooldown Parser:** Parses exact lockout durations from Binance error dialogs, persists cooldown timestamps, and enforces circuit breakers after consecutive invalid codes.
+- **In-Page Session Recycling:** Reuses the active browser page and input field without reloading heavy single-page apps, slashing bandwidth by 95% and accelerating claim speeds.
+- **Network Resilience:** Fast-recovery reconnect ladder for unstable connections with a held drops queue to process drops received during brief disconnects.
+
+## Quickstart & Installation
+
+```bash
+# Clone the repository
+git clone https://github.com/Mazonia/redpacket-claimer.git
+cd redpacket-claimer
+
+# Set up virtual environment
+python -m venv venv
+.\venv\Scripts\activate
+
+# Install dependencies and Playwright Chromium
+pip install -r requirements.txt
+playwright install chromium
+
+# Configure Telegram API credentials
+copy .env.example .env
+# Edit .env with TG_API_ID, TG_API_HASH, and CHANNELS
+
+# Run initial setup to log into Binance once
+python main.py --login
+
+# Start autonomous claiming
+python main.py
+```

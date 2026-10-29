@@ -182,6 +182,19 @@ python -m unittest test_claimer.py -v
 
 ---
 
+## ❓ Frequently Asked Questions (FAQ)
+
+### What does the Binance Auto-Claimer bot do?
+The application monitors Telegram channels in real-time for Binance Crypto Box (Red Packet) codes and Binance Square Comment-to-Earn posts, automatically redeeming codes and submitting answers using Playwright browser automation.
+
+### How does the bot protect against Binance account lockouts and rate limits?
+The bot parses exact cooldown and lockout messages directly from Binance popups, pauses submissions until the cooldown expires, halts execution if multiple dead codes fail in sequence (circuit breaker), and ignores historical dropped codes older than 3 minutes.
+
+### Does the bot require my Binance API key or secret?
+No. The bot does not require Binance API keys. It uses a persistent local Chromium browser profile (`./user_data/`) where you log into Binance directly through standard login and 2FA.
+
+---
+
 ## 📜 License
 
 MIT License. For educational and personal automation purposes.
